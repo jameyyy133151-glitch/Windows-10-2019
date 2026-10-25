@@ -20,10 +20,9 @@ jobs:
     steps:
       - name: Register RTX 3060 PnP Hardware ID (PCI\VEN_10DE&DEV_2504) & Spoof Registry
         run: |
-          Write-Host "Registering NVIDIA GeForce RTX 3060 PnP Hardware ID & WDDM Policies..."
+          Write-Host "Configuring RDP Graphics Acceleration & Virtual RTX 3060 (12GB VRAM)..."
 
-          # 1. Enable Test Signing / Unsigned Driver Installation & RDP WDDM Policies
-          bcdedit /set testsigning on | Out-Null
+          # 1. Enable RDP WDDM Policies (Safe for Azure Secure Boot VMs)
           $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           if (-not (Test-Path $tsPolicyPath)) {
               New-Item -Path $tsPolicyPath -Force | Out-Null
@@ -32,44 +31,7 @@ jobs:
           Set-ItemProperty -Path $tsPolicyPath -Name "fEnableWddmDriver" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "ColorDepth" -Value 5 -Type DWord -Force
 
-          # 2. Create Custom INF to Register RTX 3060 Hardware IDs in Windows PnP
-          $infDir = "C:\VirtualRTX3060"
-          New-Item -ItemType Directory -Path $infDir -Force | Out-Null
-          $infPath = "$infDir\nv_rtx3060_virtual.inf"
-
-          $infContent = @"
-          [Version]
-          Signature="`$WINDOWS NT`$"
-          Class=Display
-          ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
-          Provider=%NVIDIA%
-          DriverVer=10/25/2026,32.0.15.6603
-
-          [Manufacturer]
-          %NVIDIA%=NvidiaMfg,NTamd64
-
-          [NvidiaMfg.NTamd64]
-          %RTX3060%=RTX3060_Inst, Root\VEN_10DE&DEV_2504
-          %RTX3060%=RTX3060_Inst, PCI\VEN_10DE&DEV_2504&SUBSYS_88171043&REV_A1
-
-          [RTX3060_Inst.NT]
-          Include=basicdisplay.inf
-          Needs=MSBDD_Fallback.NT
-
-          [RTX3060_Inst.NT.Services]
-          Include=basicdisplay.inf
-          Needs=MSBDD_Fallback.NT.Services
-
-          [Strings]
-          NVIDIA="NVIDIA"
-          RTX3060="NVIDIA GeForce RTX 3060"
-          "@
-          Set-Content -Path $infPath -Value $infContent -Encoding ASCII
-
-          # Stage the INF into Windows Driver Store
-          pnputil /add-driver $infPath | Out-Null
-
-          # 3. Inject PCI\VEN_10DE&DEV_2504 and 12GB VRAM into Display Class Registry
+          # 2. Inject PCI\VEN_10DE&DEV_2504 and 12GB VRAM into Display Class Registry
           $displayClassBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
           $adapterKeys = Get-ChildItem -Path $displayClassBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }
 
@@ -91,26 +53,20 @@ jobs:
               }
               catch {}
           }
-          Write-Host "✅ PnP Hardware ID (PCI\VEN_10DE&DEV_2504) & 12GB VRAM profile injected."
+          Write-Host "✅ PnP Hardware ID (PCI\VEN_10DE&DEV_2504) & 12GB VRAM profile injected successfully."
 
       - name: Extract Official NVIDIA Driver Files & Create Active nvidia-smi Bridge
         run: |
           Write-Host "Staging Official NVIDIA Driver Runtime Paths & nvidia-smi..."
 
-          # Create standard NVIDIA Driver directories expected by apps and installers
           $nvSmiDir = "C:\Program Files\NVIDIA Corporation\NVSMI"
-          $nvDrvDir = "C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64_rtx3060"
           New-Item -ItemType Directory -Path $nvSmiDir -Force | Out-Null
-          New-Item -ItemType Directory -Path $nvDrvDir -Force | Out-Null
 
-          # Register NVIDIA Corporation Registry Keys checked by games/launchers/installers
           $nvRegPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak"
           New-Item -Path $nvRegPath -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "DriverVersion" -Value "566.03" -Type String -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "CardName" -Value "NVIDIA GeForce RTX 3060" -Type String -Force
 
-          # Create functional nvidia-smi.bat / CLI responder in System32 and NVSMI
-          # Apps running `nvidia-smi` or `nvidia-smi --query-gpu=...` will receive valid RTX 3060 output
           $smiScript = @'
           @echo off
           if "%1"=="--query-gpu=name,memory.total,driver_version" (
