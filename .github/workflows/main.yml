@@ -1,0 +1,37 @@
+name: Windows 2019 Build and Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner label'
+        required: true
+        default: 'windows-2019'
+
+jobs:
+  build:
+    # Uses the input value, falling back to the Windows Server 2019 image
+    runs-on: ${{ inputs.runner_label || 'windows-2019' }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify System Specifications
+        shell: pwsh
+        run: |
+          $osInfo = (Get-CimInstance Win32_OperatingSystem).Caption
+          $cpuCores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+          $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          Write-Host "=========================================="
+          Write-Host "Operating System  : $osInfo"
+          Write-Host "Logical CPU Cores : $cpuCores"
+          Write-Host "Total Physical RAM: $ramGB GB"
+          Write-Host "=========================================="
+
+      - name: Run Build Script
+        shell: cmd
+        run: |
+          echo Running build tasks on Windows Server 2019...
+          
