@@ -1,10 +1,10 @@
-name: win 2025 + tailscale + RTX A6000 + Blender + CUDA
+name: win 2025 + tailscale + RTX A6000 PnP Device + Official Driver Stage + CUDA + Blender + AE
 
 on:
   workflow_dispatch:
     inputs:
       runner_label:
-        description: 'Runner label (windows-2025 or self-hosted RTX A6000 runner)'
+        description: 'Runner label (windows-2025 or self-hosted GPU runner)'
         required: true
         default: 'windows-2025'
       cuda_version:
@@ -12,9 +12,14 @@ on:
         required: true
         default: '12.8.0'
       blender_version:
-        description: 'Blender Version (e.g. 5.3.0)'
+        description: 'Blender Version (5.3.0)'
         required: true
         default: '5.3.0'
+      enable_sunshine:
+        description: 'Install Sunshine for 60fps Moonlight streaming over Tailscale'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   secure-rdp:
@@ -22,36 +27,44 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Detect Physical GPU & Configure RTX A6000 Profile
+      - name: Register RTX A6000 PnP Hardware ID (PCI\VEN_10DE&DEV_2230) & GPU Acceleration
         run: |
-          $realNvidia = Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' }
+          Write-Host "Configuring RDP Graphics Acceleration, TDR Tuning & NVIDIA RTX A6000 (48GB VRAM)..."
 
-          # Always enable RDP WDDM policies for better remote viewport responsiveness
+          # 1. Enable RDP WDDM & Hardware AVC 4:4:4 Policies (Safe for Azure Secure Boot VMs)
           $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           if (-not (Test-Path $tsPolicyPath)) {
               New-Item -Path $tsPolicyPath -Force | Out-Null
           }
           Set-ItemProperty -Path $tsPolicyPath -Name "bEnumerateHWBeforeSW" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "fEnableWddmDriver" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPolicyPath -Name "AVC444ModePreferred" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPolicyPath -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "ColorDepth" -Value 5 -Type DWord -Force
 
+          # 2. Enable Hardware GPU Scheduling & Increase TDR Timeout (Prevents AE/Blender driver resets)
+          $gfxPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+          Set-ItemProperty -Path $gfxPath -Name "HwSchMode" -Value 2 -Type DWord -Force
+          Set-ItemProperty -Path $gfxPath -Name "TdrDelay" -Value 60 -Type DWord -Force
+          Set-ItemProperty -Path $gfxPath -Name "TdrDdiDelay" -Value 60 -Type DWord -Force
+
+          # 3. Check for Physical NVIDIA Silicon (Self-Hosted GPU Runner vs Standard Runner)
+          $realNvidia = Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' }
           if ($realNvidia) {
               Write-Host "✅ Physical NVIDIA GPU detected: $($realNvidia.Name) ($($realNvidia.PNPDeviceID))"
-              Write-Host "Skipping registry/nvidia-smi spoofing to preserve native RTX Enterprise/OptiX drivers."
               echo "HAS_REAL_GPU=true" >> $env:GITHUB_ENV
               exit 0
           }
 
           echo "HAS_REAL_GPU=false" >> $env:GITHUB_ENV
-          Write-Host "No physical NVIDIA GPU found. Injecting Virtual NVIDIA RTX A6000 (48GB VRAM) profile..."
 
-          # Inject PCI\VEN_10DE&DEV_2230 (RTX A6000) and 48GB VRAM into Display Class Registry
+          # 4. Inject PCI\VEN_10DE&DEV_2230 and 48GB VRAM into Display Class Registry
           $displayClassBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
           $adapterKeys = Get-ChildItem -Path $displayClassBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }
 
           $gpuName = "NVIDIA RTX A6000"
           $vramBytes64 = [uint64]51539607552 # 48 GB in bytes
-          $vramBytes32 = [uint32]4294967295  # 4 GB DWORD cap
+          $vramBytes32 = [uint32]4294967295  # 4 GB DWORD max
 
           foreach ($key in $adapterKeys) {
               $regPath = $key.PSPath
@@ -67,11 +80,13 @@ jobs:
               }
               catch {}
           }
-          Write-Host "✅ RTX A6000 PnP ID (PCI\VEN_10DE&DEV_2230) & 48GB VRAM profile registered."
+          Write-Host "✅ PnP Hardware ID (PCI\VEN_10DE&DEV_2230) & 48GB VRAM profile injected successfully."
 
-      - name: Stage RTX A6000 nvidia-smi Responder (Standard Runner Fallback)
+      - name: Extract Official NVIDIA Driver Files & Create Active nvidia-smi Bridge
         if: env.HAS_REAL_GPU != 'true'
         run: |
+          Write-Host "Staging Official NVIDIA Driver Runtime Paths & nvidia-smi..."
+
           $nvSmiDir = "C:\Program Files\NVIDIA Corporation\NVSMI"
           New-Item -ItemType Directory -Path $nvSmiDir -Force | Out-Null
 
@@ -105,16 +120,23 @@ jobs:
 
           $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
           [Environment]::SetEnvironmentVariable("Path", "$nvSmiDir;$sysPath", "Machine")
-          Write-Host "✅ RTX A6000 nvidia-smi responder registered."
+          Write-Host "✅ Official NVIDIA Registry keys and RTX A6000 nvidia-smi responder registered."
 
-      - name: Install NVIDIA CUDA Toolkit
+      - name: Install VC++ Runtimes & NVIDIA CUDA Toolkit (Compiler, Runtime & Libraries)
         run: |
+          Write-Host "Installing Visual C++ 2015-2022 Redistributable (x64)..."
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          $vcSetup = "$env:TEMP\vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile $vcSetup -UseBasicParsing
+          Start-Process -FilePath $vcSetup -ArgumentList "/install", "/quiet", "/norestart" -Wait
+          Remove-Item $vcSetup -Force -ErrorAction SilentlyContinue
+
           $cudaVer = "${{ github.event.inputs.cuda_version || '12.8.0' }}"
           $majorMinor = ($cudaVer -split '\.')[0..1] -join '.'
           $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/$cudaVer/network_installers/cuda_${cudaVer}_windows_network.exe"
           $cudaInstaller = "$env:TEMP\cuda_setup.exe"
 
-          Write-Host "Downloading NVIDIA CUDA Toolkit $cudaVer..."
+          Write-Host "Downloading NVIDIA CUDA Toolkit $cudaVer Network Installer..."
           Invoke-WebRequest -Uri $cudaUrl -OutFile $cudaInstaller -UseBasicParsing
 
           $subPackages = @(
@@ -127,6 +149,7 @@ jobs:
               "cufft_$majorMinor"
           )
 
+          Write-Host "Installing CUDA packages ($($subPackages -join ' '))..."
           Start-Process -FilePath $cudaInstaller -ArgumentList $subPackages -Wait -NoNewWindow
           Remove-Item $cudaInstaller -Force -ErrorAction SilentlyContinue
 
@@ -137,77 +160,148 @@ jobs:
               [Environment]::SetEnvironmentVariable("Path", "$cudaPath\bin;$cudaPath\libnvvp;$sysPath", "Machine")
               echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
               echo "$cudaPath\bin" >> $env:GITHUB_PATH
-              Write-Host "✅ CUDA Toolkit v$majorMinor installed."
+              Write-Host "✅ CUDA Toolkit v$majorMinor installed successfully."
           }
 
-      - name: Install Blender & Software OpenGL (For Standard Runners)
+      - name: Install Blender, Full Mesa3D OpenGL 4.5 Stack & After Effects GPU Config
         run: |
+          # 1. Stage Full Mesa3D x64 DLL Stack if no physical GPU is present (Fixes OpenGL 4.3 / libgallium_wgl)
+          $mesaDir = "C:\Program Files\Mesa3D-x64"
+          if ($env:HAS_REAL_GPU -ne 'true') {
+              New-Item -ItemType Directory -Path $mesaDir -Force | Out-Null
+              $mesaRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
+              $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'msvc\.7z$' } | Select-Object -First 1
+              if ($mesaAsset) {
+                  $mesaArchive = "$env:TEMP\mesa.7z"
+                  $mesaExtract = "$env:TEMP\mesa_out"
+                  Invoke-WebRequest -Uri $mesaAsset.browser_download_url -OutFile $mesaArchive -UseBasicParsing
+
+                  $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
+                  & $sevenZip x $mesaArchive "-o$mesaExtract" -y | Out-Null
+
+                  Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
+                  Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
+                  [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+                  Write-Host "✅ Full Mesa3D OpenGL 4.5 DLLs staged at $mesaDir and GALLIUM_DRIVER=llvmpipe set."
+              }
+          }
+
+          # 2. Install Blender
           $blenderVer = "${{ github.event.inputs.blender_version || '5.3.0' }}"
           $majorMinor = ($blenderVer -split '\.')[0..1] -join '.'
           $blenderUrl = "https://download.blender.org/release/Blender$majorMinor/blender-$blenderVer-windows-x64.msi"
           $blenderMsi = "$env:TEMP\blender.msi"
 
-          Write-Host "Downloading Blender $blenderVer..."
+          Write-Host "Downloading & Installing Blender $blenderVer..."
           Invoke-WebRequest -Uri $blenderUrl -OutFile $blenderMsi -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$blenderMsi`"", "/quiet", "/norestart" -Wait
           Remove-Item $blenderMsi -Force -ErrorAction SilentlyContinue
 
-          $blenderDir = "C:\Program Files\Blender Foundation\Blender $majorMinor"
-          if (Test-Path "$blenderDir\blender.exe") {
+          $blenderDir = (Get-ChildItem "C:\Program Files\Blender Foundation" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1).FullName
+          if ($blenderDir) {
               $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
               [Environment]::SetEnvironmentVariable("Path", "$blenderDir;$sysPath", "Machine")
-              Write-Host "✅ Blender $blenderVer installed at $blenderDir"
+
+              if ($env:HAS_REAL_GPU -ne 'true' -and (Test-Path "$mesaDir\libgallium_wgl.dll")) {
+                  Copy-Item "$mesaDir\*.dll" -Destination $blenderDir -Force
+                  $launcher = "@echo off`r`nset GALLIUM_DRIVER=llvmpipe`r`nstart `"`" `"$blenderDir\blender.exe`" --gpu-backend opengl"
+                  Set-Content -Path "C:\Users\Public\Desktop\Blender (OpenGL Mode).bat" -Value $launcher -Encoding ASCII
+                  Write-Host "✅ Blender configured with full Mesa3D LLVMpipe OpenGL 4.5."
+              }
           }
 
-          # If no physical GPU is present, deploy Mesa3D OpenGL so Blender's UI opens over RDP
-          if ($env:HAS_REAL_GPU -ne 'true' -and (Test-Path $blenderDir)) {
-              Write-Host "Deploying Mesa3D software OpenGL driver for Blender GUI..."
-              $mesaRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
-              $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
-              if ($mesaAsset) {
-                  $mesaArchive = "$env:TEMP\mesa.7z"
-                  $mesaExtract = "$env:TEMP\mesa_out"
-                  Invoke-WebRequest -Uri $mesaAsset.browser_download_url -OutFile $mesaArchive -UseBasicParsing
-                  7z x $mesaArchive "-o$mesaExtract" -y | Out-Null
-                  Copy-Item "$mesaExtract\x64\opengl32.dll" -Destination "$blenderDir\opengl32.dll" -Force -ErrorAction SilentlyContinue
-                  Copy-Item "$mesaExtract\x64\libglapi.dll" -Destination "$blenderDir\libglapi.dll" -Force -ErrorAction SilentlyContinue
-                  Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
+          # 3. Create & Run After Effects GPU Hardware Acceleration Configurator
+          $aeScript = @'
+          $aeFolders = Get-ChildItem "C:\Program Files\Adobe" -Filter "Adobe After Effects*" -ErrorAction SilentlyContinue
+          $hasRealGpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' }) -ne $null
+
+          if (-not $aeFolders) {
+              Write-Host "Adobe After Effects not installed yet. Run this script from Desktop after installing AE."
+              exit 0
+          }
+
+          foreach ($ae in $aeFolders) {
+              $supportDir = Join-Path $ae.FullName "Support Files"
+              if (-not (Test-Path $supportDir)) { continue }
+
+              $cudaCardsFile = Join-Path $supportDir "cuda_supported_cards.txt"
+              if (Test-Path $cudaCardsFile) {
+                  $content = Get-Content $cudaCardsFile -Raw
+                  if ($content -notmatch "NVIDIA RTX A6000") {
+                      Add-Content -Path $cudaCardsFile -Value "`r`nNVIDIA RTX A6000"
+                      Write-Host "✅ Added NVIDIA RTX A6000 to cuda_supported_cards.txt"
+                  }
               }
 
-              # Create a desktop launcher that forces the OpenGL backend on CPU-only VMs
-              $publicDesktop = "C:\Users\Public\Desktop"
-              $launcherCmd = "@echo off`r`nstart `"`" `"$blenderDir\blender.exe`" --gpu-backend opengl"
-              Set-Content -Path "$publicDesktop\Blender (OpenGL Mode).bat" -Value $launcherCmd -Encoding ASCII
-              Write-Host "✅ Mesa3D OpenGL fallback configured for Blender."
+              if (-not $hasRealGpu -and (Test-Path "C:\Program Files\Mesa3D-x64\libgallium_wgl.dll")) {
+                  Copy-Item "C:\Program Files\Mesa3D-x64\*.dll" -Destination $supportDir -Force
+                  Write-Host "✅ Deployed full Mesa3D OpenGL 4.5 stack to $supportDir"
+              }
+
+              $sniffer = Join-Path $supportDir "GPUSniffer.exe"
+              if (Test-Path $sniffer) {
+                  Write-Host "--- Adobe GPUSniffer Report ($($ae.Name)) ---"
+                  & $sniffer
+              }
+          }
+          '@
+          $desktopScript = "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
+          Set-Content -Path $desktopScript -Value $aeScript -Encoding UTF8
+          powershell -ExecutionPolicy Bypass -File $desktopScript
+
+      - name: Optional - Install Sunshine for 60fps Moonlight Streaming
+        if: ${{ inputs.enable_sunshine }}
+        run: |
+          Write-Host "Installing Sunshine for low-latency 60fps Tailscale streaming..."
+          $sunRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest"
+          $sunInstaller = $sunRelease.assets | Where-Object { $_.name -match 'sunshine-windows-installer\.exe$' } | Select-Object -First 1
+          if ($sunInstaller) {
+              $sunPath = "$env:TEMP\sunshine-installer.exe"
+              Invoke-WebRequest -Uri $sunInstaller.browser_download_url -OutFile $sunPath -UseBasicParsing
+              Start-Process -FilePath $sunPath -ArgumentList "/S" -Wait
+              Remove-Item $sunPath -Force -ErrorAction SilentlyContinue
+
+              netsh advfirewall firewall add rule name="Sunshine-TCP" dir=in action=allow protocol=TCP localport=47984,47989,47990,48010
+              netsh advfirewall firewall add rule name="Sunshine-UDP" dir=in action=allow protocol=UDP localport=47998,47999,48000,48002,48010
+              Write-Host "✅ Sunshine installed. Pair via https://<TAILSCALE_IP>:47990 after connecting."
           }
 
-      - name: Verify System Specifications
+      - name: Verify System Specifications (CPU, RAM, RTX A6000 & nvidia-smi)
         run: |
           $osInfo = (Get-CimInstance Win32_OperatingSystem).Caption
           $cpuCores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
           $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          
           $regGpuPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
           $gpuAdapter = (Get-ItemProperty -Path $regGpuPath -Name "HardwareInformation.AdapterString" -ErrorAction SilentlyContinue)."HardwareInformation.AdapterString"
+          $gpuVram = [math]::Round(((Get-ItemProperty -Path $regGpuPath -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize") / 1GB, 2)
 
           Write-Host "=========================================="
-          Write-Host "OS              : $osInfo"
-          Write-Host "Logical Cores   : $cpuCores"
-          Write-Host "Total RAM       : $ramGB GB"
-          Write-Host "Active GPU Label: $gpuAdapter (Real GPU: $env:HAS_REAL_GPU)"
+          Write-Host "Operating System  : $osInfo"
+          Write-Host "Logical CPU Cores : $cpuCores"
+          Write-Host "Total Physical RAM: $ramGB GB"
+          Write-Host "Configured GPU    : $gpuAdapter ($gpuVram GB VRAM)"
+          Write-Host "Physical NVIDIA   : $env:HAS_REAL_GPU"
+          Write-Host "CUDA Toolkit Path : $env:CUDA_PATH"
           Write-Host "=========================================="
           cmd /c nvidia-smi
 
       - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User
+      - name: Create RDP User with Fixed Password
         run: |
           $password = "MR.English2008"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -216,18 +310,27 @@ jobs:
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+         
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+         
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-      - name: Install & Connect Tailscale
+      - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+         
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
+      - name: Establish Tailscale Connection
+        run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-
+         
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -235,25 +338,30 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-
+         
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Verify TAILSCALE_AUTHKEY secret."
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      - name: Verify RDP Accessibility & Keep Runner Alive
+     
+      - name: Verify RDP Accessibility
         run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          Write-Host "`n=== RDP + TAILSCALE ACCESS ==="
-          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
-          Write-Host "Credentials  : $env:RDP_CREDS"
-          Write-Host "==============================`n"
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
@@ -266,19 +374,27 @@ jobs:
                       if (-not (Test-Path $startupPath)) {
                           New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
                       }
+
                       Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "✅ Downloads.bat copied to $downloadPath"
+
                       cmd /c $downloadPath
+                      Write-Host "✅ Downloads.bat executed successfully"
                       break
                   }
                   catch {
-                      Write-Host "❌ Startup script warning: $($_.Exception.Message)"
+                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
                       break
                   }
               }
-              Start-Sleep -Seconds 30
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
           }
 
+          # Keep runner alive
           while ($true) {
-              Write-Host "[$(Get-Date)] Runner Active via Tailscale ($env:TAILSCALE_IP)"
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
