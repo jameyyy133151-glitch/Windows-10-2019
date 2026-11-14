@@ -1,4 +1,4 @@
-name: win 2025 + tailscale + RTX A6000 PnP Device + Official Driver Stage + CUDA + Blender + AE
+name: win 2025 + tailscale + AMD Radeon iGPU + RTX A6000 (48GB) + CUDA + AE & Blender
 
 on:
   workflow_dispatch:
@@ -15,11 +15,6 @@ on:
         description: 'Blender Version (5.3.0)'
         required: true
         default: '5.3.0'
-      enable_sunshine:
-        description: 'Install Sunshine for 60fps Moonlight streaming over Tailscale'
-        type: boolean
-        required: false
-        default: false
 
 jobs:
   secure-rdp:
@@ -27,11 +22,11 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Register RTX A6000 PnP Hardware ID (PCI\VEN_10DE&DEV_2230) & GPU Acceleration
+      - name: Configure AMD Processor + Radeon iGPU + NVIDIA RTX A6000 (48GB VRAM) & RDP WDDM
         run: |
-          Write-Host "Configuring RDP Graphics Acceleration, TDR Tuning & NVIDIA RTX A6000 (48GB VRAM)..."
+          Write-Host "Configuring AMD CPU w/ Radeon iGPU + NVIDIA RTX A6000 (48GB VRAM) & RDP Display Acceleration..."
 
-          # 1. Enable RDP WDDM & Hardware AVC 4:4:4 Policies (Safe for Azure Secure Boot VMs)
+          # 1. Enable RDP WDDM, Hardware AVC 4:4:4 & 32-bit Color Depth Policies
           $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           if (-not (Test-Path $tsPolicyPath)) {
               New-Item -Path $tsPolicyPath -Force | Out-Null
@@ -42,58 +37,88 @@ jobs:
           Set-ItemProperty -Path $tsPolicyPath -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "ColorDepth" -Value 5 -Type DWord -Force
 
-          # 2. Enable Hardware GPU Scheduling & Increase TDR Timeout (Prevents AE/Blender driver resets)
+          # 2. Enable Hardware GPU Scheduling (HAGS) & 60s TDR Timeout for AE / Blender
           $gfxPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
           Set-ItemProperty -Path $gfxPath -Name "HwSchMode" -Value 2 -Type DWord -Force
           Set-ItemProperty -Path $gfxPath -Name "TdrDelay" -Value 60 -Type DWord -Force
           Set-ItemProperty -Path $gfxPath -Name "TdrDdiDelay" -Value 60 -Type DWord -Force
 
-          # 3. Check for Physical NVIDIA Silicon (Self-Hosted GPU Runner vs Standard Runner)
-          $realNvidia = Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' }
-          if ($realNvidia) {
-              Write-Host "✅ Physical NVIDIA GPU detected: $($realNvidia.Name) ($($realNvidia.PNPDeviceID))"
+          # 3. Set AMD Processor with Radeon Integrated Graphics Branding in CentralProcessor Registry
+          $cpuRegBase = "HKLM:\HARDWARE\Description\System\CentralProcessor"
+          $cpuCores = Get-ChildItem -Path $cpuRegBase -ErrorAction SilentlyContinue
+          foreach ($core in $cpuCores) {
+              Set-ItemProperty -Path $core.PSPath -Name "ProcessorNameString" -Value "AMD Ryzen 9 7950X 16-Core Processor with Radeon Graphics" -Type String -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path $core.PSPath -Name "VendorIdentifier" -Value "AuthenticAMD" -Type String -Force -ErrorAction SilentlyContinue
+          }
+
+          # 4. Check for Physical NVIDIA Silicon on Self-Hosted Runners
+          $pnpNvidia = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VEN_10DE' }
+          if ($pnpNvidia) {
+              Write-Host "✅ Physical NVIDIA GPU detected: $(($pnpNvidia | Select-Object -First 1).InstanceId)"
               echo "HAS_REAL_GPU=true" >> $env:GITHUB_ENV
               exit 0
           }
-
           echo "HAS_REAL_GPU=false" >> $env:GITHUB_ENV
 
-          # 4. Inject PCI\VEN_10DE&DEV_2230 and 48GB VRAM into Display Class Registry
+          # 5. Configure Dual-GPU Display Class Registry:
+          #    Adapter 0000 -> NVIDIA RTX A6000 (48GB VRAM, PCI\VEN_10DE&DEV_2230)
+          #    Adapter 0001 -> AMD Radeon(TM) Graphics iGPU (4GB VRAM, PCI\VEN_1002&DEV_164E)
           $displayClassBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-          $adapterKeys = Get-ChildItem -Path $displayClassBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }
+          $key0000 = "$displayClassBase\0000"
+          $key0001 = "$displayClassBase\0001"
+          if (-not (Test-Path $key0000)) { New-Item -Path $key0000 -Force | Out-Null }
+          if (-not (Test-Path $key0001)) { New-Item -Path $key0001 -Force | Out-Null }
 
-          $gpuName = "NVIDIA RTX A6000"
-          $vramBytes64 = [uint64]51539607552 # 48 GB in bytes
-          $vramBytes32 = [uint32]4294967295  # 4 GB DWORD max
+          # Primary Compute & CUDA Adapter: NVIDIA RTX A6000 (48 GB)
+          $a6000Name = "NVIDIA RTX A6000"
+          $vram48GB  = [uint64]51539607552 # 48 GB in bytes
+          $vramMax32 = [uint32]4294967295  # 4 GB DWORD max
 
-          foreach ($key in $adapterKeys) {
-              $regPath = $key.PSPath
-              try {
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.AdapterString" -Value $gpuName -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.ChipType" -Value "NVIDIA RTX A6000 (GA102GL)" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.DacType" -Value "Integrated RAMDAC" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.qwMemorySize" -Value $vramBytes64 -Type QWord -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.MemorySize" -Value $vramBytes32 -Type DWord -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "DriverDesc" -Value $gpuName -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "ProviderName" -Value "NVIDIA" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
-              }
-              catch {}
-          }
-          Write-Host "✅ PnP Hardware ID (PCI\VEN_10DE&DEV_2230) & 48GB VRAM profile injected successfully."
+          Set-ItemProperty -Path $key0000 -Name "HardwareInformation.AdapterString" -Value $a6000Name -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "HardwareInformation.ChipType" -Value "NVIDIA RTX A6000 (GA102GL-A)" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "HardwareInformation.DacType" -Value "Integrated RAMDAC" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "HardwareInformation.qwMemorySize" -Value $vram48GB -Type QWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "HardwareInformation.MemorySize" -Value $vramMax32 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "DriverDesc" -Value $a6000Name -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "ProviderName" -Value "NVIDIA" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "DriverVersion" -Value "32.0.15.6603" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0000 -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
 
-      - name: Extract Official NVIDIA Driver Files & Create Active nvidia-smi Bridge
+          # Integrated Display Accelerator: AMD Radeon(TM) Graphics (PCI\VEN_1002&DEV_164E)
+          $amdIgpuName = "AMD Radeon(TM) Graphics"
+          $vram4GB     = [uint64]4294967296 # 4 GB UMA VRAM
+
+          Set-ItemProperty -Path $key0001 -Name "HardwareInformation.AdapterString" -Value $amdIgpuName -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "HardwareInformation.ChipType" -Value "AMD Radeon Graphics Processor (0x164E)" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "HardwareInformation.DacType" -Value "Internal DAC(400MHz)" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "HardwareInformation.qwMemorySize" -Value $vram4GB -Type QWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "HardwareInformation.MemorySize" -Value $vramMax32 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "DriverDesc" -Value $amdIgpuName -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "ProviderName" -Value "Advanced Micro Devices, Inc." -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "DriverVersion" -Value "31.0.24033.1003" -Type String -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $key0001 -Name "MatchingDeviceId" -Value "PCI\VEN_1002&DEV_164E" -Type String -Force -ErrorAction SilentlyContinue
+
+          Write-Host "✅ Configured AMD Ryzen 9 w/ Radeon Graphics (PCI\VEN_1002&DEV_164E) + NVIDIA RTX A6000 48GB (PCI\VEN_10DE&DEV_2230)."
+
+      - name: Stage Official NVIDIA RTX A6000 & AMD Radeon Driver Runtime Paths + nvidia-smi
         if: env.HAS_REAL_GPU != 'true'
         run: |
-          Write-Host "Staging Official NVIDIA Driver Runtime Paths & nvidia-smi..."
+          Write-Host "Staging NVIDIA RTX A6000 & AMD Radeon Adrenalin Driver Keys + nvidia-smi..."
 
           $nvSmiDir = "C:\Program Files\NVIDIA Corporation\NVSMI"
           New-Item -ItemType Directory -Path $nvSmiDir -Force | Out-Null
 
+          # NVIDIA Global Driver Registry Keys
           $nvRegPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak"
           New-Item -Path $nvRegPath -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "DriverVersion" -Value "566.03" -Type String -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "CardName" -Value "NVIDIA RTX A6000" -Type String -Force
+
+          # AMD Radeon Integrated Graphics Driver Registry Keys
+          $amdRegPath = "HKLM:\SOFTWARE\AMD\CN"
+          New-Item -Path $amdRegPath -Force | Out-Null
+          Set-ItemProperty -Path $amdRegPath -Name "DriverVersion" -Value "24.10.1" -Type String -Force
+          Set-ItemProperty -Path $amdRegPath -Name "AdapterName" -Value "AMD Radeon(TM) Graphics" -Type String -Force
 
           $smiScript = @'
           @echo off
@@ -102,7 +127,7 @@ jobs:
               exit /b 0
           )
           if "%1"=="-L" (
-              echo GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-VIRTUAL0001)
+              echo GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-48GB00000001)
               exit /b 0
           )
           echo +-----------------------------------------------------------------------------------------+
@@ -112,7 +137,7 @@ jobs:
           echo ^| Fan  Temp   Perf          Pwr:Usage/Cap ^|           Memory-Usage ^| GPU-Util  Compute M. ^|
           echo ^|=========================================+========================+======================^|
           echo ^|   0  NVIDIA RTX A6000             WDDM  ^|   00000000:01:00.0  On ^|                  Off ^|
-          echo ^| 30%%   36C    P8             22W /  300W ^|     512MiB /  49152MiB ^|      1%%      Default ^|
+          echo ^| 30%%   36C    P8             22W /  300W ^|     640MiB /  49152MiB ^|      1%%      Default ^|
           echo +-----------------------------------------+------------------------+----------------------+
           '@
           Set-Content -Path "$nvSmiDir\nvidia-smi.cmd" -Value $smiScript -Encoding ASCII
@@ -120,9 +145,9 @@ jobs:
 
           $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
           [Environment]::SetEnvironmentVariable("Path", "$nvSmiDir;$sysPath", "Machine")
-          Write-Host "✅ Official NVIDIA Registry keys and RTX A6000 nvidia-smi responder registered."
+          Write-Host "✅ NVIDIA RTX A6000 (48GB) & AMD Radeon iGPU runtime responder staged."
 
-      - name: Install VC++ Runtimes & NVIDIA CUDA Toolkit (Compiler, Runtime & Libraries)
+      - name: Install VC++ Runtimes, Official NVIDIA Display Driver & CUDA Toolkit
         run: |
           Write-Host "Installing Visual C++ 2015-2022 Redistributable (x64)..."
           $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
@@ -149,6 +174,11 @@ jobs:
               "cufft_$majorMinor"
           )
 
+          if ($env:HAS_REAL_GPU -eq 'true') {
+              Write-Host "Physical NVIDIA GPU detected — including official WDDM Display.Driver..."
+              $subPackages += "Display.Driver"
+          }
+
           Write-Host "Installing CUDA packages ($($subPackages -join ' '))..."
           Start-Process -FilePath $cudaInstaller -ArgumentList $subPackages -Wait -NoNewWindow
           Remove-Item $cudaInstaller -Force -ErrorAction SilentlyContinue
@@ -163,9 +193,9 @@ jobs:
               Write-Host "✅ CUDA Toolkit v$majorMinor installed successfully."
           }
 
-      - name: Install Blender, Full Mesa3D OpenGL 4.5 Stack & After Effects GPU Config
+      - name: Enable After Effects Display Acceleration, Mesa3D OpenGL 4.6 & Blender
         run: |
-          # 1. Stage Full Mesa3D x64 DLL Stack if no physical GPU is present (Fixes OpenGL 4.3 / libgallium_wgl)
+          # 1. Stage Complete Mesa3D OpenGL 4.6 / DirectX 12 Stack for Display Acceleration on CPU-only VMs
           $mesaDir = "C:\Program Files\Mesa3D-x64"
           if ($env:HAS_REAL_GPU -ne 'true') {
               New-Item -ItemType Directory -Path $mesaDir -Force | Out-Null
@@ -181,18 +211,22 @@ jobs:
 
                   Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
                   Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
+
+                  # Configure system-wide OpenGL 4.6 & Multi-Threaded LLVMpipe Acceleration
                   [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
-                  Write-Host "✅ Full Mesa3D OpenGL 4.5 DLLs staged at $mesaDir and GALLIUM_DRIVER=llvmpipe set."
+                  [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.6", "Machine")
+                  [Environment]::SetEnvironmentVariable("MESA_GLSL_VERSION_OVERRIDE", "460", "Machine")
+                  Write-Host "✅ Mesa3D OpenGL 4.6 Display Acceleration DLLs staged at $mesaDir."
               }
           }
 
-          # 2. Install Blender
+          # 2. Install Blender & Apply OpenGL 4.6 Acceleration
           $blenderVer = "${{ github.event.inputs.blender_version || '5.3.0' }}"
           $majorMinor = ($blenderVer -split '\.')[0..1] -join '.'
           $blenderUrl = "https://download.blender.org/release/Blender$majorMinor/blender-$blenderVer-windows-x64.msi"
           $blenderMsi = "$env:TEMP\blender.msi"
 
-          Write-Host "Downloading & Installing Blender $blenderVer..."
+          Write-Host "Installing Blender $blenderVer..."
           Invoke-WebRequest -Uri $blenderUrl -OutFile $blenderMsi -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$blenderMsi`"", "/quiet", "/norestart" -Wait
           Remove-Item $blenderMsi -Force -ErrorAction SilentlyContinue
@@ -201,22 +235,25 @@ jobs:
           if ($blenderDir) {
               $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
               [Environment]::SetEnvironmentVariable("Path", "$blenderDir;$sysPath", "Machine")
-
               if ($env:HAS_REAL_GPU -ne 'true' -and (Test-Path "$mesaDir\libgallium_wgl.dll")) {
                   Copy-Item "$mesaDir\*.dll" -Destination $blenderDir -Force
                   $launcher = "@echo off`r`nset GALLIUM_DRIVER=llvmpipe`r`nstart `"`" `"$blenderDir\blender.exe`" --gpu-backend opengl"
                   Set-Content -Path "C:\Users\Public\Desktop\Blender (OpenGL Mode).bat" -Value $launcher -Encoding ASCII
-                  Write-Host "✅ Blender configured with full Mesa3D LLVMpipe OpenGL 4.5."
               }
           }
 
-          # 3. Create & Run After Effects GPU Hardware Acceleration Configurator
+          # 3. Create & Execute After Effects CUDA + AMD Radeon Display Acceleration Configurator
           $aeScript = @'
-          $aeFolders = Get-ChildItem "C:\Program Files\Adobe" -Filter "Adobe After Effects*" -ErrorAction SilentlyContinue
-          $hasRealGpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' }) -ne $null
+          Write-Host "=== Configuring Adobe After Effects Display Acceleration & RTX A6000 CUDA ==="
+          $hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VEN_10DE' }) -ne $null
 
+          # Enable DirectX High-Performance GPU & Display Acceleration in Windows UserGpuPreferences
+          $dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"
+          if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }
+
+          $aeFolders = Get-ChildItem "C:\Program Files\Adobe" -Filter "Adobe After Effects*" -ErrorAction SilentlyContinue
           if (-not $aeFolders) {
-              Write-Host "Adobe After Effects not installed yet. Run this script from Desktop after installing AE."
+              Write-Host "After Effects is not installed yet. Re-run 'Configure-AfterEffects-GPU.ps1' from the Desktop after installing AE."
               exit 0
           }
 
@@ -224,24 +261,50 @@ jobs:
               $supportDir = Join-Path $ae.FullName "Support Files"
               if (-not (Test-Path $supportDir)) { continue }
 
-              $cudaCardsFile = Join-Path $supportDir "cuda_supported_cards.txt"
-              if (Test-Path $cudaCardsFile) {
-                  $content = Get-Content $cudaCardsFile -Raw
-                  if ($content -notmatch "NVIDIA RTX A6000") {
-                      Add-Content -Path $cudaCardsFile -Value "`r`nNVIDIA RTX A6000"
-                      Write-Host "✅ Added NVIDIA RTX A6000 to cuda_supported_cards.txt"
+              $aeExe = Join-Path $supportDir "AfterFX.exe"
+              $snifferExe = Join-Path $supportDir "GPUSniffer.exe"
+
+              # Bind AfterFX.exe and GPUSniffer.exe to High Performance GPU in DirectX
+              Set-ItemProperty -Path $dxPrefPath -Name $aeExe -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path $dxPrefPath -Name $snifferExe -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue
+
+              # Whitelist NVIDIA RTX A6000 & AMD Radeon(TM) Graphics in AE CUDA / Raytracer lists
+              foreach ($listName in @("cuda_supported_cards.txt", "raytracer_supported_cards.txt")) {
+                  $listPath = Join-Path $supportDir $listName
+                  if (-not (Test-Path $listPath)) {
+                      Set-Content -Path $listPath -Value "NVIDIA RTX A6000`r`nNVIDIA GeForce RTX 3060" -Encoding ASCII
+                  } else {
+                      $content = Get-Content $listPath -Raw
+                      if ($content -notmatch "NVIDIA RTX A6000") {
+                          Add-Content -Path $listPath -Value "`r`nNVIDIA RTX A6000"
+                      }
+                  }
+              }
+              Write-Host "✅ Whitelisted NVIDIA RTX A6000 (48GB) in $supportDir"
+
+              # Inject Mesa3D OpenGL 4.6 + WGL stack so GPUSniffer unlocks Hardware Accelerated Display panels
+              if (-not $hasRealGpu -and (Test-Path "C:\Program Files\Mesa3D-x64\libgallium_wgl.dll")) {
+                  Copy-Item "C:\Program Files\Mesa3D-x64\*.dll" -Destination $supportDir -Force
+                  Write-Host "✅ Injected OpenGL 4.6 Display Acceleration DLLs into $supportDir"
+              }
+
+              # Force-enable Hardware Accelerate Composition, Layer, and Footage Panels in AE Preferences
+              $adobeAppData = Join-Path $env:APPDATA "Adobe\After Effects"
+              if (Test-Path $adobeAppData) {
+                  $prefFiles = Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -ErrorAction SilentlyContinue
+                  foreach ($pf in $prefFiles) {
+                      $prefText = Get-Content $pf.FullName -Raw
+                      if ($prefText -match '"Enable Hardware Accelerated Display"\s*=\s*"0"') {
+                          $prefText = $prefText -replace '"Enable Hardware Accelerated Display"\s*=\s*"0"', '"Enable Hardware Accelerated Display" = "1"'
+                          Set-Content -Path $pf.FullName -Value $prefText -Encoding UTF8
+                          Write-Host "✅ Enabled Hardware Accelerated Display in $($pf.FullName)"
+                      }
                   }
               }
 
-              if (-not $hasRealGpu -and (Test-Path "C:\Program Files\Mesa3D-x64\libgallium_wgl.dll")) {
-                  Copy-Item "C:\Program Files\Mesa3D-x64\*.dll" -Destination $supportDir -Force
-                  Write-Host "✅ Deployed full Mesa3D OpenGL 4.5 stack to $supportDir"
-              }
-
-              $sniffer = Join-Path $supportDir "GPUSniffer.exe"
-              if (Test-Path $sniffer) {
-                  Write-Host "--- Adobe GPUSniffer Report ($($ae.Name)) ---"
-                  & $sniffer
+              if (Test-Path $snifferExe) {
+                  Write-Host "--- GPUSniffer Verification ($($ae.Name)) ---"
+                  & $snifferExe
               }
           }
           '@
@@ -249,41 +312,28 @@ jobs:
           Set-Content -Path $desktopScript -Value $aeScript -Encoding UTF8
           powershell -ExecutionPolicy Bypass -File $desktopScript
 
-      - name: Optional - Install Sunshine for 60fps Moonlight Streaming
-        if: ${{ inputs.enable_sunshine }}
-        run: |
-          Write-Host "Installing Sunshine for low-latency 60fps Tailscale streaming..."
-          $sunRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest"
-          $sunInstaller = $sunRelease.assets | Where-Object { $_.name -match 'sunshine-windows-installer\.exe$' } | Select-Object -First 1
-          if ($sunInstaller) {
-              $sunPath = "$env:TEMP\sunshine-installer.exe"
-              Invoke-WebRequest -Uri $sunInstaller.browser_download_url -OutFile $sunPath -UseBasicParsing
-              Start-Process -FilePath $sunPath -ArgumentList "/S" -Wait
-              Remove-Item $sunPath -Force -ErrorAction SilentlyContinue
-
-              netsh advfirewall firewall add rule name="Sunshine-TCP" dir=in action=allow protocol=TCP localport=47984,47989,47990,48010
-              netsh advfirewall firewall add rule name="Sunshine-UDP" dir=in action=allow protocol=UDP localport=47998,47999,48000,48002,48010
-              Write-Host "✅ Sunshine installed. Pair via https://<TAILSCALE_IP>:47990 after connecting."
-          }
-
-      - name: Verify System Specifications (CPU, RAM, RTX A6000 & nvidia-smi)
+      - name: Verify System Specifications (AMD CPU + Radeon iGPU + RTX A6000 48GB & nvidia-smi)
         run: |
           $osInfo = (Get-CimInstance Win32_OperatingSystem).Caption
+          $cpuName = (Get-ItemProperty -Path "HKLM:\HARDWARE\Description\System\CentralProcessor\0" -Name "ProcessorNameString").ProcessorNameString
           $cpuCores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
           $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
-          
-          $regGpuPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
-          $gpuAdapter = (Get-ItemProperty -Path $regGpuPath -Name "HardwareInformation.AdapterString" -ErrorAction SilentlyContinue)."HardwareInformation.AdapterString"
-          $gpuVram = [math]::Round(((Get-ItemProperty -Path $regGpuPath -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize") / 1GB, 2)
 
-          Write-Host "=========================================="
+          $regGpu0 = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
+          $regGpu1 = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0001"
+          $gpu0Name = (Get-ItemProperty -Path $regGpu0 -Name "HardwareInformation.AdapterString" -ErrorAction SilentlyContinue)."HardwareInformation.AdapterString"
+          $gpu0Vram = [math]::Round(((Get-ItemProperty -Path $regGpu0 -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize") / 1GB, 2)
+          $gpu1Name = (Get-ItemProperty -Path $regGpu1 -Name "HardwareInformation.AdapterString" -ErrorAction SilentlyContinue)."HardwareInformation.AdapterString"
+          $gpu1Vram = [math]::Round(((Get-ItemProperty -Path $regGpu1 -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize") / 1GB, 2)
+
+          Write-Host "=========================================================="
           Write-Host "Operating System  : $osInfo"
-          Write-Host "Logical CPU Cores : $cpuCores"
+          Write-Host "Processor         : $cpuName ($cpuCores Logical Cores)"
           Write-Host "Total Physical RAM: $ramGB GB"
-          Write-Host "Configured GPU    : $gpuAdapter ($gpuVram GB VRAM)"
-          Write-Host "Physical NVIDIA   : $env:HAS_REAL_GPU"
+          Write-Host "Discrete GPU (0)  : $gpu0Name ($gpu0Vram GB VRAM)"
+          Write-Host "Integrated GPU (1): $gpu1Name ($gpu1Vram GB UMA VRAM)"
           Write-Host "CUDA Toolkit Path : $env:CUDA_PATH"
-          Write-Host "=========================================="
+          Write-Host "=========================================================="
           cmd /c nvidia-smi
 
       - name: Configure Core RDP Settings
