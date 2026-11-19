@@ -1,4 +1,4 @@
-name: win 2025 + tailscale + AMD CPU + Official NVIDIA RTX A6000 WHQL Driver + Hardware Acceleration
+name: Win 2025 + Tailscale + Official NVIDIA RTX A6000 RDP Driver + NVIDIA Control Panel
 
 on:
   workflow_dispatch:
@@ -8,29 +8,25 @@ on:
         required: true
         default: 'windows-2025'
       nvidia_driver_version:
-        description: 'Official NVIDIA RTX A6000 WHQL Driver Version'
+        description: 'Official NVIDIA RTX A6000 Enterprise WHQL Driver Version'
         required: true
         default: '553.09'
       cuda_version:
         description: 'CUDA Toolkit Version (12.8.0)'
         required: true
         default: '12.8.0'
-      blender_version:
-        description: 'Blender Version (5.3.0)'
-        required: true
-        default: '5.3.0'
 
 jobs:
-  secure-rdp:
+  rtx-a6000-rdp:
     runs-on: ${{ github.event.inputs.runner_label || 'windows-2025' }}
     timeout-minutes: 350
 
     steps:
-      - name: Configure AMD Processor, WDDM Hardware Acceleration & Official RTX A6000 Registry Signatures
+      - name: Configure RDP GPU Acceleration (60FPS, WDDM, AVC 444) & Detect Hardware
         run: |
-          Write-Host "Configuring AMD Ryzen 9 Processor, WDDM Hardware Acceleration & NVIDIA RTX A6000 Driver Signatures..."
+          Write-Host "Configuring Windows Server 2025 RDP GPU policies and 60 FPS streaming..."
 
-          # 1. Enable RDP WDDM Hardware Acceleration, AVC 4:4:4 & 32-bit Color Policies
+          # 1. Force Hardware Graphics Adapter for all RDP/RDS sessions + WDDM + AVC 4:4:4
           $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           if (-not (Test-Path $tsPolicyPath)) {
               New-Item -Path $tsPolicyPath -Force | Out-Null
@@ -40,14 +36,25 @@ jobs:
           Set-ItemProperty -Path $tsPolicyPath -Name "AVC444ModePreferred" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPolicyPath -Name "ColorDepth" -Value 5 -Type DWord -Force
+          Set-ItemProperty -Path $tsPolicyPath -Name "fDisableAudioCapture" -Value 0 -Type DWord -Force
 
-          # 2. Enable DirectX Hardware-Accelerated GPU Scheduling (HAGS) & 60s TDR Timeout
+          # Unlock 60 FPS RDP composition
+          $winStationsPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+          Set-ItemProperty -Path $winStationsPath -Name "DWMFRAMEINTERVAL" -Value 15 -Type DWord -Force
+
+          # Enable Windows Audio Services over RDP
+          foreach ($svc in @("AudioEndpointBuilder", "Audiosrv")) {
+              Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+              Start-Service -Name $svc -ErrorAction SilentlyContinue
+          }
+
+          # 2. Enable Hardware-Accelerated GPU Scheduling (HAGS) & 60s TDR Timeout
           $gfxPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
           Set-ItemProperty -Path $gfxPath -Name "HwSchMode" -Value 2 -Type DWord -Force
           Set-ItemProperty -Path $gfxPath -Name "TdrDelay" -Value 60 -Type DWord -Force
           Set-ItemProperty -Path $gfxPath -Name "TdrDdiDelay" -Value 60 -Type DWord -Force
 
-          # 3. Configure AMD Processor Branding Across All Logical Cores
+          # 3. Configure AMD Processor Branding
           $amdCpuName = "AMD Ryzen 9 7950X 16-Core Processor with Radeon Graphics"
           $cpuRegBase = "HKLM:\HARDWARE\Description\System\CentralProcessor"
           Get-ChildItem -Path $cpuRegBase -ErrorAction SilentlyContinue | ForEach-Object {
@@ -55,42 +62,46 @@ jobs:
               Set-ItemProperty -Path $_.PSPath -Name "VendorIdentifier" -Value "AuthenticAMD" -Type String -Force -ErrorAction SilentlyContinue
           }
 
-          # 4. Detect Physical NVIDIA GPU (Self-Hosted GPU Runner Check)
+          # 4. Detect Physical NVIDIA PCIe GPU
           $pnpNvidia = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VEN_10DE' }
           if ($pnpNvidia) {
               Write-Host "Physical NVIDIA GPU detected: $(($pnpNvidia | Select-Object -First 1).InstanceId)"
               echo "HAS_REAL_GPU=true" >> $env:GITHUB_ENV
           } else {
-              Write-Host "No physical PCIe NVIDIA GPU detected (CPU-only VM). Will extract and stage official RTX A6000 WHQL driver binaries."
+              Write-Host "No physical NVIDIA PCIe GPU detected (CPU-only VM). Staging driver files in fallback mode."
               echo "HAS_REAL_GPU=false" >> $env:GITHUB_ENV
           }
 
-      - name: Download & Install Official NVIDIA RTX A6000 WHQL Enterprise Driver
+      - name: Download & Install Official NVIDIA RTX A6000 Driver & NVIDIA Control Panel
         run: |
           $drvVer = "${{ github.event.inputs.nvidia_driver_version || '553.09' }}"
           $driverUrl = "https://us.download.nvidia.com/Windows/Quadro_Certified/$drvVer/$drvVer-quadro-rtx-desktop-notebook-win10-win11-64bit-international-dch-whql.exe"
           $driverExe = "$env:TEMP\nvidia_rtx_a6000_driver.exe"
           $extractDir = "$env:TEMP\nvidia_extracted"
 
-          Write-Host "Downloading Official NVIDIA RTX / Quadro Enterprise Driver v$drvVer for RTX A6000..."
+          Write-Host "Downloading Official NVIDIA RTX A6000 Enterprise Driver v$drvVer..."
           & curl.exe -L --retry 3 -o $driverExe $driverUrl
 
           $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
 
           if ($env:HAS_REAL_GPU -eq 'true') {
-              Write-Host "Physical NVIDIA GPU present. Running official silent driver installer..."
+              Write-Host "Extracting and installing full RTX A6000 driver natively..."
               & $sevenZip x $driverExe "-o$extractDir" -y | Out-Null
               Start-Process -FilePath "$extractDir\setup.exe" -ArgumentList "-s", "-noreboot", "-clean" -Wait -NoNewWindow
-              Write-Host "Official NVIDIA RTX A6000 kernel & display driver installed natively."
+
+              # Ensure NVIDIA Display Container service runs for NVIDIA Control Panel
+              if (Get-Service -Name "NVDisplay.ContainerLocalSystem" -ErrorAction SilentlyContinue) {
+                  Set-Service -Name "NVDisplay.ContainerLocalSystem" -StartupType Automatic -ErrorAction SilentlyContinue
+                  Start-Service -Name "NVDisplay.ContainerLocalSystem" -ErrorAction SilentlyContinue
+              }
           } else {
-              Write-Host "Extracting official NVIDIA Display.Driver & NVWMI components via 7-Zip..."
-              & $sevenZip x $driverExe "Display.Driver/*" "-o$extractDir" -y | Out-Null
+              Write-Host "Extracting Display.Driver and Control Panel components via 7-Zip..."
+              & $sevenZip x $driverExe "Display.Driver/*" "NVI2/*" "-o$extractDir" -y | Out-Null
 
               $dispDrvDir = "$extractDir\Display.Driver"
               if (Test-Path $dispDrvDir) {
                   $infFile = Get-ChildItem -Path $dispDrvDir -Filter "nv_disp*.inf" | Select-Object -First 1
                   if ($infFile) {
-                      Write-Host "Staging official $($infFile.Name) into Windows DriverStore via pnputil..."
                       pnputil.exe /add-driver $infFile.FullName | Out-Null
                   }
 
@@ -105,11 +116,11 @@ jobs:
                       $foundDll = Get-ChildItem -Path $dispDrvDir -Filter "$srcName*" -ErrorAction SilentlyContinue | Select-Object -First 1
                       if ($foundDll -and $foundDll.Extension -eq ".dll") {
                           Copy-Item $foundDll.FullName -Destination $dllMappings[$srcName] -Force -ErrorAction SilentlyContinue
-                          Write-Host "Staged official signed binary: $($dllMappings[$srcName])"
                       }
                   }
               }
 
+              # Stamp Display Class registry for RTX A6000 metadata
               $displayClassBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
               $adapterKeys = Get-ChildItem -Path $displayClassBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }
               $gpuName = "NVIDIA RTX A6000"
@@ -128,11 +139,9 @@ jobs:
                   Set-ItemProperty -Path $regPath -Name "DriverVersion" -Value "32.0.15.5309" -Type String -Force -ErrorAction SilentlyContinue
                   Set-ItemProperty -Path $regPath -Name "DriverDate" -Value "10-15-2024" -Type String -Force -ErrorAction SilentlyContinue
                   Set-ItemProperty -Path $regPath -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "UserModeDriverName" -Value "C:\Windows\System32\nvldumdx.dll" -Type MultiString -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "OpenGLDriverName" -Value "C:\Windows\System32\nvoglv64.dll" -Type MultiString -Force -ErrorAction SilentlyContinue
               }
 
-              # Elevate to NT AUTHORITY\SYSTEM to Rename Active Display Adapter in Device Manager (Indentation-safe array)
+              # Rename Device Manager Display Adapter using SYSTEM task (Indentation-safe array)
               $enumLines = @(
                   '$enumDisplayAdapters = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue'
                   'foreach ($dev in $enumDisplayAdapters) {'
@@ -141,13 +150,6 @@ jobs:
                   '        Set-ItemProperty -Path $enumKey -Name "FriendlyName" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue'
                   '        Set-ItemProperty -Path $enumKey -Name "DeviceDesc" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue'
                   '        Set-ItemProperty -Path $enumKey -Name "Mfg" -Value "NVIDIA" -Type String -Force -ErrorAction SilentlyContinue'
-                  '    }'
-                  '}'
-                  '$enumCpus = Get-PnpDevice -Class Processor -ErrorAction SilentlyContinue'
-                  'foreach ($cpu in $enumCpus) {'
-                  '    $cpuEnumKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($cpu.InstanceId)"'
-                  '    if (Test-Path $cpuEnumKey) {'
-                  '        Set-ItemProperty -Path $cpuEnumKey -Name "FriendlyName" -Value "AMD Ryzen 9 7950X 16-Core Processor with Radeon Graphics" -Type String -Force -ErrorAction SilentlyContinue'
                   '    }'
                   '}'
               )
@@ -160,9 +162,49 @@ jobs:
               Remove-Item $enumScriptPath -Force -ErrorAction SilentlyContinue
           }
 
+          # Install NVIDIA Control Panel (AppX from driver bundle or winget msstore fallback)
+          Write-Host "Setting up NVIDIA Control Panel..."
+          $nvcplInstalled = Get-AppxPackage -AllUsers -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue
+
+          if (-not $nvcplInstalled) {
+              # 1. Check if the extracted driver contains a bundled NVCPL AppX package
+              $bundledAppx = Get-ChildItem -Path $extractDir -Include "*NVIDIAControlPanel*.appx*","*NVCPL*.appx*" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($bundledAppx) {
+                  Write-Host "Installing bundled NVIDIA Control Panel package: $($bundledAppx.Name)"
+                  Add-AppxPackage -Path $bundledAppx.FullName -ErrorAction SilentlyContinue
+              }
+          }
+
+          if (-not (Get-AppxPackage -AllUsers -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue)) {
+              # 2. Attempt installation via winget using Microsoft Store ID 9NF8H0H7WMLT
+              if (Get-Command winget -ErrorAction SilentlyContinue) {
+                  Write-Host "Installing NVIDIA Control Panel via winget (9NF8H0H7WMLT)..."
+                  winget install --id 9NF8H0H7WMLT -s msstore --accept-package-agreements --accept-source-agreements --silent 2>$null | Out-Null
+              }
+          }
+
+          # Enable NVIDIA Control Panel desktop context menu policy key
+          $nvGlobalPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NvCplApi\Policies"
+          if (-not (Test-Path $nvGlobalPath)) { New-Item -Path $nvGlobalPath -Force | Out-Null }
+          Set-ItemProperty -Path $nvGlobalPath -Name "ContextUIPolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
+
+          # Create a Desktop shortcut script to launch or diagnose NVIDIA Control Panel
+          $nvcplLaunchLines = @(
+              '$pkg = Get-AppxPackage -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue'
+              'if ($pkg) {'
+              '    Start-Process "shell:AppsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel"'
+              '} elseif (Test-Path "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe") {'
+              '    Start-Process "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe"'
+              '} else {'
+              '    Write-Host "NVIDIA Control Panel is not installed or requires a physical NVIDIA GPU and Microsoft.VCLibs.x64 on Windows Server." -ForegroundColor Yellow'
+              '    Pause'
+              '}'
+          )
+          Set-Content -Path "C:\Users\Public\Desktop\Launch-NVIDIA-Control-Panel.ps1" -Value $nvcplLaunchLines -Encoding UTF8
+
           Remove-Item $driverExe, $extractDir -Recurse -Force -ErrorAction SilentlyContinue
 
-      - name: Compile Native 64-Bit nvidia-smi.exe & Stage NVIDIA Application Runtime Keys
+      - name: Stage nvidia-smi Fallback (CPU-Only Runner)
         if: env.HAS_REAL_GPU != 'true'
         run: |
           $nvSmiDir = "C:\Program Files\NVIDIA Corporation\NVSMI"
@@ -171,8 +213,6 @@ jobs:
           New-Item -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "DriverVersion" -Value "553.09" -Type String -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "CardName" -Value "NVIDIA RTX A6000" -Type String -Force
-          New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\nvlddmkm" -Name "Description" -Value "NVIDIA Windows Kernel Mode Driver, Version 553.09" -Type String -Force
 
           $csLines = @(
               'using System;'
@@ -183,10 +223,6 @@ jobs:
               '            Console.WriteLine("NVIDIA RTX A6000, 49152 MiB, 553.09");'
               '            return 0;'
               '        }'
-              '        if (joined.Contains("--query-gpu=")) {'
-              '            Console.WriteLine("NVIDIA RTX A6000, 49152, 512, 48640, 553.09, 12.8, 0, 36");'
-              '            return 0;'
-              '        }'
               '        if (joined.Contains("-L")) {'
               '            Console.WriteLine("GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-48GB00000001)");'
               '            return 0;'
@@ -194,9 +230,6 @@ jobs:
               '        Console.WriteLine("+-----------------------------------------------------------------------------------------+");'
               '        Console.WriteLine("| NVIDIA-SMI 553.09                 Driver Version: 553.09         CUDA Version: 12.8     |");'
               '        Console.WriteLine("|-----------------------------------------+------------------------+----------------------+");'
-              '        Console.WriteLine("| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |");'
-              '        Console.WriteLine("| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |");'
-              '        Console.WriteLine("|=========================================+========================+======================|");'
               '        Console.WriteLine("|   0  NVIDIA RTX A6000             WDDM  |   00000000:01:00.0  On |                  Off |");'
               '        Console.WriteLine("| 30%   36C    P8             22W /  300W |     640MiB /  49152MiB |      1%      Default |");'
               '        Console.WriteLine("+-----------------------------------------+------------------------+----------------------+");'
@@ -206,8 +239,7 @@ jobs:
           )
           $csFile = "$env:TEMP\nvidia_smi.cs"
           Set-Content -Path $csFile -Value $csLines -Encoding UTF8
-          $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-          & $csc /nologo /target:exe /out:"$nvSmiDir\nvidia-smi.exe" $csFile
+          & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /out:"$nvSmiDir\nvidia-smi.exe" $csFile
           Copy-Item "$nvSmiDir\nvidia-smi.exe" -Destination "C:\Windows\System32\nvidia-smi.exe" -Force
           Remove-Item $csFile -Force -ErrorAction SilentlyContinue
 
@@ -216,10 +248,8 @@ jobs:
 
       - name: Install VC++ Runtimes & NVIDIA CUDA Toolkit
         run: |
-          Write-Host "Installing Visual C++ 2015-2022 Redistributable (x64)..."
-          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
           $vcSetup = "$env:TEMP\vc_redist.x64.exe"
-          Invoke-WebRequest -Uri $vcUrl -OutFile $vcSetup -UseBasicParsing
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile $vcSetup -UseBasicParsing
           Start-Process -FilePath $vcSetup -ArgumentList "/install", "/quiet", "/norestart" -Wait
           Remove-Item $vcSetup -Force -ErrorAction SilentlyContinue
 
@@ -228,19 +258,8 @@ jobs:
           $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/$cudaVer/network_installers/cuda_${cudaVer}_windows_network.exe"
           $cudaInstaller = "$env:TEMP\cuda_setup.exe"
 
-          Write-Host "Downloading NVIDIA CUDA Toolkit $cudaVer Network Installer..."
           Invoke-WebRequest -Uri $cudaUrl -OutFile $cudaInstaller -UseBasicParsing
-
-          $subPackages = @(
-              "-s",
-              "nvcc_$majorMinor",
-              "cudart_$majorMinor",
-              "cublas_$majorMinor",
-              "cublas_dev_$majorMinor",
-              "curand_$majorMinor",
-              "cufft_$majorMinor"
-          )
-
+          $subPackages = @("-s", "nvcc_$majorMinor", "cudart_$majorMinor", "cublas_$majorMinor", "cublas_dev_$majorMinor", "curand_$majorMinor", "cufft_$majorMinor")
           Start-Process -FilePath $cudaInstaller -ArgumentList $subPackages -Wait -NoNewWindow
           Remove-Item $cudaInstaller -Force -ErrorAction SilentlyContinue
 
@@ -253,7 +272,7 @@ jobs:
               echo "$cudaPath\bin" >> $env:GITHUB_PATH
           }
 
-      - name: Enable OpenGL 4.6 Acceleration, Suppress AE Compatibility Warning & Install Blender
+      - name: Enable OpenGL 4.6 (Mesa3D Fallback) & Optimize After Effects GPU Preferences
         run: |
           $mesaDir = "C:\Program Files\Mesa3D-x64"
           if ($env:HAS_REAL_GPU -ne 'true') {
@@ -264,10 +283,8 @@ jobs:
                   $mesaArchive = "$env:TEMP\mesa.7z"
                   $mesaExtract = "$env:TEMP\mesa_out"
                   Invoke-WebRequest -Uri $mesaAsset.browser_download_url -OutFile $mesaArchive -UseBasicParsing
-
                   $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
                   & $sevenZip x $mesaArchive "-o$mesaExtract" -y | Out-Null
-
                   Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
                   Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -277,35 +294,11 @@ jobs:
               }
           }
 
-          # Install Blender
-          $blenderVer = "${{ github.event.inputs.blender_version || '5.3.0' }}"
-          $majorMinor = ($blenderVer -split '\.')[0..1] -join '.'
-          $blenderUrl = "https://download.blender.org/release/Blender$majorMinor/blender-$blenderVer-windows-x64.msi"
-          $blenderMsi = "$env:TEMP\blender.msi"
-
-          Invoke-WebRequest -Uri $blenderUrl -OutFile $blenderMsi -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$blenderMsi`"", "/quiet", "/norestart" -Wait
-          Remove-Item $blenderMsi -Force -ErrorAction SilentlyContinue
-
-          $blenderDir = (Get-ChildItem "C:\Program Files\Blender Foundation" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1).FullName
-          if ($blenderDir) {
-              $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-              [Environment]::SetEnvironmentVariable("Path", "$blenderDir;$sysPath", "Machine")
-              if ($env:HAS_REAL_GPU -ne 'true' -and (Test-Path "$mesaDir\libgallium_wgl.dll")) {
-                  Copy-Item "$mesaDir\*.dll" -Destination $blenderDir -Force
-              }
-          }
-
-          # Auto-Configurator for After Effects GPU Whitelist & Suppressing System Compatibility Report Warning (Indentation-safe array)
           $aeLines = @(
-              'Write-Host "=== Configuring Adobe After Effects GPU Whitelist & Suppressing Driver Warning ==="'
               '$hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "VEN_10DE" }) -ne $null'
               '$dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"'
               'if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }'
               'Set-ItemProperty -Path $dxPrefPath -Name "DirectXUserGlobalSettings" -Value "SwapEffectUpgradeEnable=1;" -Type String -Force -ErrorAction SilentlyContinue'
-              'Get-ChildItem "C:\Program Files\Blender Foundation\*\blender.exe" -ErrorAction SilentlyContinue | ForEach-Object {'
-              '    Set-ItemProperty -Path $dxPrefPath -Name $_.FullName -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue'
-              '}'
               '$aeExes = Get-ChildItem "C:\Program Files\Adobe","C:\Users" -Filter "AfterFX.exe" -Recurse -ErrorAction SilentlyContinue'
               'foreach ($aeFile in $aeExes) {'
               '    $supportDir = $aeFile.DirectoryName'
@@ -333,8 +326,8 @@ jobs:
               'if (Test-Path $adobeAppData) {'
               '    Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {'
               '        $prefText = Get-Content $_.FullName -Raw'
-              '        $prefText = $prefText -replace ''\"Enable Hardware Accelerated Display\"\s*=\s*\"0\"'', ''\"Enable Hardware Accelerated Display\" = \"1\"'''
-              '        $prefText = $prefText -replace ''\"Show System Compatibility Issues at Startup\"\s*=\s*\"1\"'', ''\"Show System Compatibility Issues at Startup\" = \"0\"'''
+              '        $prefText = $prefText -replace ''"Enable Hardware Accelerated Display"\s*=\s*"0"'', ''"Enable Hardware Accelerated Display" = "1"'''
+              '        $prefText = $prefText -replace ''"Show System Compatibility Issues at Startup"\s*=\s*"1"'', ''"Show System Compatibility Issues at Startup" = "0"'''
               '        Set-Content -Path $_.FullName -Value $prefText -Encoding UTF8'
               '    }'
               '}'
@@ -343,27 +336,29 @@ jobs:
           Set-Content -Path $desktopScript -Value $aeLines -Encoding UTF8
           powershell -ExecutionPolicy Bypass -File $desktopScript
 
-      - name: Verify System Specifications & Driver Status
+      - name: Verify Driver, RDP GPU Policies & Control Panel Status
         run: |
-          $regGpu0 = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
-          $gpu0Name = (Get-ItemProperty -Path $regGpu0 -Name "HardwareInformation.AdapterString" -ErrorAction SilentlyContinue)."HardwareInformation.AdapterString"
-          $drvVer = (Get-ItemProperty -Path $regGpu0 -Name "DriverVersion" -ErrorAction SilentlyContinue).DriverVersion
-          $drvDate = (Get-ItemProperty -Path $regGpu0 -Name "DriverDate" -ErrorAction SilentlyContinue).DriverDate
+          $tsPolicy = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -ErrorAction SilentlyContinue
+          $nvcplPkg = Get-AppxPackage -AllUsers -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue
           Write-Host "=========================================================="
-          Write-Host "Primary GPU Profile   : $gpu0Name"
-          Write-Host "Driver Version & Date : $drvVer ($drvDate)"
+          Write-Host "Physical NVIDIA GPU   : $env:HAS_REAL_GPU"
+          Write-Host "RDP HW Adapter Policy : $($tsPolicy.bEnumerateHWBeforeSW)"
+          Write-Host "RDP WDDM Driver       : $($tsPolicy.fEnableWddmDriver)"
+          Write-Host "Control Panel AppX    : $([bool]$nvcplPkg)"
           Write-Host "System32 nvcuda.dll   : $(Test-Path 'C:\Windows\System32\nvcuda.dll')"
           Write-Host "=========================================================="
           nvidia-smi.exe
 
-      - name: Configure Core RDP Settings
+      - name: Configure Core RDP Settings (TCP & UDP 3389)
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale-TCP" 2>$null
+          netsh advfirewall firewall delete rule name="RDP-Tailscale-UDP" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale-TCP" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale-UDP" dir=in action=allow protocol=UDP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User & Enable runneradmin RDP Access
@@ -390,7 +385,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=rtx-a6000-rdp-$env:GITHUB_RUN_ID
 
           $tsIP = $null
           $retries = 0
@@ -404,6 +399,7 @@ jobs:
       - name: Maintain Connection + Watch RDP User & Apply GPU Preferences
         run: |
           Write-Host "=== RDP READY AT $env:TAILSCALE_IP ==="
+          Write-Host "Credentials: $env:RDP_CREDS"
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
