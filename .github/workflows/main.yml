@@ -141,19 +141,17 @@ jobs:
                   Set-ItemProperty -Path $regPath -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
               }
 
-              $enumLines = @(
-                  '$enumDisplayAdapters = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue'
-                  'foreach ($dev in $enumDisplayAdapters) {'
-                  '    $enumKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)"'
-                  '    if (Test-Path $enumKey) {'
-                  '        Set-ItemProperty -Path $enumKey -Name "FriendlyName" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue'
-                  '        Set-ItemProperty -Path $enumKey -Name "DeviceDesc" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue'
-                  '        Set-ItemProperty -Path $enumKey -Name "Mfg" -Value "NVIDIA" -Type String -Force -ErrorAction SilentlyContinue'
-                  '    }'
-                  '}'
-              )
+              # Rename Device Manager Display Adapter via SYSTEM task (line-by-line, no subexpressions)
               $enumScriptPath = "$env:TEMP\set_enum_nvidia.ps1"
-              Set-Content -Path $enumScriptPath -Value $enumLines -Encoding UTF8
+              Set-Content -Path $enumScriptPath -Value 'Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '  $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($_.InstanceId)"' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '  if (Test-Path $k) {' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "FriendlyName" -Value "NVIDIA RTX A6000" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "DeviceDesc" -Value "NVIDIA RTX A6000" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "Mfg" -Value "NVIDIA" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '  }' -Encoding UTF8
+              Add-Content -Path $enumScriptPath -Value '}' -Encoding UTF8
+
               schtasks /Create /TN "RenameDisplayAdapter" /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$enumScriptPath`"" /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null
               schtasks /Run /TN "RenameDisplayAdapter" | Out-Null
               Start-Sleep -Seconds 3
@@ -161,7 +159,7 @@ jobs:
               Remove-Item $enumScriptPath -Force -ErrorAction SilentlyContinue
           }
 
-          # Install NVIDIA Control Panel (with 45s timeout so winget never stalls)
+          # Install NVIDIA Control Panel (45s timeout so winget never stalls)
           if (-not (Get-AppxPackage -AllUsers -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue)) {
               $bundledAppx = Get-ChildItem -Path $extractDir -Include "*NVIDIAControlPanel*.appx*","*NVCPL*.appx*" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
               if ($bundledAppx) {
@@ -179,19 +177,17 @@ jobs:
           if (-not (Test-Path $nvGlobalPath)) { New-Item -Path $nvGlobalPath -Force | Out-Null }
           Set-ItemProperty -Path $nvGlobalPath -Name "ContextUIPolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
 
-          $nvcplLaunchLines = @(
-              '$pkg = Get-AppxPackage -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue'
-              'if ($pkg) {'
-              '    Start-Process "shell:AppsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel"'
-              '} elseif (Test-Path "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe") {'
-              '    Start-Process "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe"'
-              '} else {'
-              '    Write-Host "NVIDIA Control Panel requires a physical NVIDIA GPU attached to this VM." -ForegroundColor Yellow'
-              '    Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-Table -AutoSize'
-              '    Pause'
-              '}'
-          )
-          Set-Content -Path "C:\Users\Public\Desktop\Launch-NVIDIA-Control-Panel.ps1" -Value $nvcplLaunchLines -Encoding UTF8
+          $nvcplLauncher = "C:\Users\Public\Desktop\Launch-NVIDIA-Control-Panel.ps1"
+          Set-Content -Path $nvcplLauncher -Value '$pkg = Get-AppxPackage -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value 'if ($pkg) {' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '  Start-Process "shell:AppsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel"' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '} elseif (Test-Path "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe") {' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '  Start-Process "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe"' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '} else {' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '  Write-Host "NVIDIA Control Panel requires a physical NVIDIA GPU attached to this VM." -ForegroundColor Yellow' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '  Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-Table -AutoSize' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '  Pause' -Encoding UTF8
+          Add-Content -Path $nvcplLauncher -Value '}' -Encoding UTF8
 
           Remove-Item $driverExe, $extractDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -204,25 +200,23 @@ jobs:
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "DriverVersion" -Value "553.09" -Type String -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "CardName" -Value "NVIDIA RTX A6000" -Type String -Force
 
-          $csLines = @(
-              'using System;'
-              'class Program {'
-              '    static int Main(string[] args) {'
-              '        string joined = string.Join(" ", args);'
-              '        if (joined.Contains("--query-gpu=name,memory.total,driver_version")) { Console.WriteLine("NVIDIA RTX A6000, 49152 MiB, 553.09"); return 0; }'
-              '        if (joined.Contains("-L")) { Console.WriteLine("GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-48GB00000001)"); return 0; }'
-              '        Console.WriteLine("+-----------------------------------------------------------------------------------------+");'
-              '        Console.WriteLine("| NVIDIA-SMI 553.09                 Driver Version: 553.09         CUDA Version: 12.8     |");'
-              '        Console.WriteLine("|-----------------------------------------+------------------------+----------------------+");'
-              '        Console.WriteLine("|   0  NVIDIA RTX A6000             WDDM  |   00000000:01:00.0  On |                  Off |");'
-              '        Console.WriteLine("| 30%   36C    P8             22W /  300W |     640MiB /  49152MiB |      1%      Default |");'
-              '        Console.WriteLine("+-----------------------------------------+------------------------+----------------------+");'
-              '        return 0;'
-              '    }'
-              '}'
-          )
           $csFile = "$env:TEMP\nvidia_smi.cs"
-          Set-Content -Path $csFile -Value $csLines -Encoding UTF8
+          Set-Content -Path $csFile -Value 'using System;' -Encoding UTF8
+          Add-Content -Path $csFile -Value 'class Program {' -Encoding UTF8
+          Add-Content -Path $csFile -Value '  static int Main(string[] args) {' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    string j = string.Join(" ", args);' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    if (j.Contains("--query-gpu=")) { Console.WriteLine("NVIDIA RTX A6000, 49152 MiB, 553.09"); return 0; }' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    if (j.Contains("-L")) { Console.WriteLine("GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-48GB00000001)"); return 0; }' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("+-----------------------------------------------------------------------------------------+");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("| NVIDIA-SMI 553.09                 Driver Version: 553.09         CUDA Version: 12.8     |");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("|-----------------------------------------+------------------------+----------------------+");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("|   0  NVIDIA RTX A6000             WDDM  |   00000000:01:00.0  On |                  Off |");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("| 30%   36C    P8             22W /  300W |     640MiB /  49152MiB |      1%      Default |");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    Console.WriteLine("+-----------------------------------------------------------------------------------------+");' -Encoding UTF8
+          Add-Content -Path $csFile -Value '    return 0;' -Encoding UTF8
+          Add-Content -Path $csFile -Value '  }' -Encoding UTF8
+          Add-Content -Path $csFile -Value '}' -Encoding UTF8
+
           & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /out:"$nvSmiDir\nvidia-smi.exe" $csFile
           Copy-Item "$nvSmiDir\nvidia-smi.exe" -Destination "C:\Windows\System32\nvidia-smi.exe" -Force
           Remove-Item $csFile -Force -ErrorAction SilentlyContinue
@@ -281,10 +275,171 @@ jobs:
               }
           }
 
-          $aeLines = @(
-              '$hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "VEN_10DE" }) -ne $null'
-              '$dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"'
-              'if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }'
-              'Set-ItemProperty -Path $dxPrefPath -Name "DirectXUserGlobalSettings" -Value "SwapEffectUpgradeEnable=1;" -Type String -Force -ErrorAction SilentlyContinue'
-              '$aeExes = Get-ChildItem "C:\Program Files\Adobe","C:\Users" -Filter "AfterFX.exe" -Recurse -ErrorAction SilentlyContinue'
- 
+          # Write After Effects GPU configurator line-by-line (zero nested quote escaping)
+          $aeScript = "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
+          Set-Content -Path $aeScript -Value '$hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "VEN_10DE" }) -ne $null' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"' -Encoding UTF8
+          Add-Content -Path $aeScript -Value 'if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value 'Set-ItemProperty -Path $dxPrefPath -Name "DirectXUserGlobalSettings" -Value "SwapEffectUpgradeEnable=1;" -Type String -Force -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$aeExes = Get-ChildItem "C:\Program Files\Adobe","C:\Users" -Filter "AfterFX.exe" -Recurse -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $aeScript -Value 'foreach ($aeFile in $aeExes) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  $supportDir = $aeFile.DirectoryName' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  $snifferExe = Join-Path $supportDir "GPUSniffer.exe"' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  Set-ItemProperty -Path $dxPrefPath -Name $aeFile.FullName -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  if (Test-Path $snifferExe) { Set-ItemProperty -Path $dxPrefPath -Name $snifferExe -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  foreach ($listName in @("cuda_supported_cards.txt", "raytracer_supported_cards.txt")) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    $listPath = Join-Path $supportDir $listName' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    if (-not (Test-Path $listPath)) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '      Set-Content -Path $listPath -Value "NVIDIA RTX A6000" -Encoding ASCII' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    } elseif ((Get-Content $listPath -Raw) -notmatch "NVIDIA RTX A6000") {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '      Add-Content -Path $listPath -Value "NVIDIA RTX A6000"' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  if (-not $hasRealGpu -and (Test-Path "C:\Program Files\Mesa3D-x64\libgallium_wgl.dll")) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    Copy-Item "C:\Program Files\Mesa3D-x64\*.dll" -Destination $supportDir -Force' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$q = [char]34' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$adobeAppData = Join-Path $env:APPDATA "Adobe\After Effects"' -Encoding UTF8
+          Add-Content -Path $aeScript -Value 'if (Test-Path $adobeAppData) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    $txt = Get-Content $_.FullName -Raw' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Enable Hardware Accelerated Display" + $q + "\s*=\s*" + $q + "0" + $q), ($q + "Enable Hardware Accelerated Display" + $q + " = " + $q + "1" + $q)' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Show System Compatibility Issues at Startup" + $q + "\s*=\s*" + $q + "1" + $q), ($q + "Show System Compatibility Issues at Startup" + $q + " = " + $q + "0" + $q)' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '    Set-Content -Path $_.FullName -Value $txt -Encoding UTF8' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File $aeScript
+          Write-Host "Mesa3D OpenGL 4.6 and After Effects GPU configurator ready."
+
+      - name: Verify GPU, DirectX & RDP Policies
+        run: |
+          $tsPolicy = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -ErrorAction SilentlyContinue
+          Write-Host "=========================================================="
+          Write-Host "Physical NVIDIA GPU   : $env:HAS_REAL_GPU ($env:DETECTED_GPU_NAME)"
+          Write-Host "RDP HW Adapter Policy : $($tsPolicy.bEnumerateHWBeforeSW)"
+          Write-Host "RDP WDDM Driver       : $($tsPolicy.fEnableWddmDriver)"
+          Write-Host "System32 nvcuda.dll   : $(Test-Path 'C:\Windows\System32\nvcuda.dll')"
+          Write-Host "=========================================================="
+          nvidia-smi.exe
+
+      - name: Configure Core RDP Settings (TCP & UDP 3389)
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale-TCP" 2>$null
+          netsh advfirewall firewall delete rule name="RDP-Tailscale-UDP" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale-TCP" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale-UDP" dir=in action=allow protocol=UDP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User & Enable runneradmin Access
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          Set-LocalUser -Name "runneradmin" -Password $securePass -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          "RDP_CREDS=User: RDP (or runneradmin) | Password: $password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install & Connect Tailscale (Fast Unattended Mode)
+        timeout-minutes: 5
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+              Write-Error "TAILSCALE_AUTHKEY secret is missing! Add a REUSABLE key in GitHub Secrets."
+              exit 1
+          }
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Write-Host "[1/4] Downloading Tailscale MSI..."
+          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o $installerPath $tsUrl
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $installerPath)) {
+              Write-Error "Tailscale download failed."
+              exit 1
+          }
+
+          Write-Host "[2/4] Installing Tailscale silently (No GUI launch)..."
+          $msiArgs = "/i `"$installerPath`" /qn /norestart TS_NOLAUNCH=true TS_UNATTENDEDMODE=always"
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -PassThru
+          if (-not $proc.WaitForExit(120000)) {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              Write-Error "Tailscale MSI timed out after 120s."
+              exit 1
+          }
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          Write-Host "[3/4] Starting Tailscale service..."
+          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          Write-Host "[4/4] Authenticating with Tailscale (60s timeout)..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --unattended --auth-key="$env:TS_AUTHKEY" --hostname="rtx-a6000-rdp-$env:GITHUB_RUN_ID" --timeout=60s
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale login failed/timed out. Make sure TAILSCALE_AUTHKEY is a fresh REUSABLE key."
+              exit 1
+          }
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 10; $i++) {
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
+              if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Connected, but failed to get Tailscale IPv4."
+              exit 1
+          }
+
+          Write-Host "Tailscale Connected! IP: $tsIP"
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Maintain Connection + Watch RDP User & Apply GPU Preferences
+        run: |
+          Write-Host "=== RDP READY AT $env:TAILSCALE_IP ==="
+          Write-Host "Credentials: $env:RDP_CREDS"
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+                      $gpuStartupCmd = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1`""
+                      Set-Content -Path "$startupPath\AutoConfigureGPU.bat" -Value $gpuStartupCmd -Encoding ASCII
+
+                      & curl.exe -fsSL -o $downloadPath $downloadUrl
+                      cmd /c $downloadPath
+                      powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
+                      break
+                  }
+                  catch {
+                      break
+                  }
+              }
+              else {
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          while ($true) {
+              Start-Sleep -Seconds 300
+          }
