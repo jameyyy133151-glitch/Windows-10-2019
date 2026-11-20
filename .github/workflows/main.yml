@@ -92,7 +92,7 @@ jobs:
           $extractDir = "$env:TEMP\nvidia_extracted"
 
           Write-Host "Downloading Official NVIDIA RTX A6000 Enterprise Driver v$drvVer..."
-          & curl.exe -fsSL --retry 3 --connect-timeout 15 -o $driverExe $driverUrl
+          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 180 -o $driverExe $driverUrl
           $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
 
           if ($env:HAS_REAL_GPU -eq 'true') {
@@ -141,7 +141,6 @@ jobs:
                   Set-ItemProperty -Path $regPath -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
               }
 
-              # Rename Device Manager Display Adapter via SYSTEM task (line-by-line, no subexpressions)
               $enumScriptPath = "$env:TEMP\set_enum_nvidia.ps1"
               Set-Content -Path $enumScriptPath -Value 'Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
               Add-Content -Path $enumScriptPath -Value '  $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($_.InstanceId)"' -Encoding UTF8
@@ -228,7 +227,7 @@ jobs:
         timeout-minutes: 10
         run: |
           $vcSetup = "$env:TEMP\vc_redist.x64.exe"
-          & curl.exe -fsSL --retry 3 -o $vcSetup "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o $vcSetup "https://aka.ms/vs/17/release/vc_redist.x64.exe"
           Start-Process -FilePath $vcSetup -ArgumentList "/install", "/quiet", "/norestart" -Wait
           Remove-Item $vcSetup -Force -ErrorAction SilentlyContinue
 
@@ -237,7 +236,7 @@ jobs:
           $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/$cudaVer/network_installers/cuda_${cudaVer}_windows_network.exe"
           $cudaInstaller = "$env:TEMP\cuda_setup.exe"
 
-          & curl.exe -fsSL --retry 3 -o $cudaInstaller $cudaUrl
+          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o $cudaInstaller $cudaUrl
           $subPackages = @("-s", "nvcc_$majorMinor", "cudart_$majorMinor", "cublas_$majorMinor", "cublas_dev_$majorMinor", "curand_$majorMinor", "cufft_$majorMinor")
           Start-Process -FilePath $cudaInstaller -ArgumentList $subPackages -Wait -NoNewWindow
           Remove-Item $cudaInstaller -Force -ErrorAction SilentlyContinue
@@ -252,36 +251,58 @@ jobs:
           }
 
       - name: Enable OpenGL 4.6 (Mesa3D) & Optimize After Effects GPU Settings
-        timeout-minutes: 8
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ProgressPreference = 'SilentlyContinue'
           $mesaDir = "C:\Program Files\Mesa3D-x64"
-          if ($env:HAS_REAL_GPU -ne 'true') {
-              New-Item -ItemType Directory -Path $mesaDir -Force | Out-Null
-              $mesaRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest"
-              $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'msvc\.7z$' } | Select-Object -First 1
-              if ($mesaAsset) {
-                  $mesaArchive = "$env:TEMP\mesa.7z"
-                  $mesaExtract = "$env:TEMP\mesa_out"
-                  & curl.exe -fsSL --retry 3 -o $mesaArchive $mesaAsset.browser_download_url
-                  $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
-                  & $sevenZip x $mesaArchive "-o$mesaExtract" -y | Out-Null
-                  Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
-                  Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
 
-                  [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
-                  [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.6", "Machine")
-                  [Environment]::SetEnvironmentVariable("MESA_GLSL_VERSION_OVERRIDE", "460", "Machine")
+          if ($env:HAS_REAL_GPU -ne 'true') {
+              Write-Host "[1/3] Querying latest Mesa3D Windows release (authenticated, 20s timeout)..."
+              New-Item -ItemType Directory -Path $mesaDir -Force | Out-Null
+              try {
+                  $headers = @{
+                      "Authorization" = "Bearer $env:GH_TOKEN"
+                      "User-Agent"    = "GitHub-Actions"
+                      "Accept"        = "application/vnd.github+json"
+                  }
+                  $mesaRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $headers -TimeoutSec 20
+                  $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+                  if (-not $mesaAsset) {
+                      $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'msvc\.7z$' } | Select-Object -First 1
+                  }
+                  if ($mesaAsset) {
+                      Write-Host "[2/3] Downloading & extracting $($mesaAsset.name)..."
+                      $mesaArchive = "$env:TEMP\mesa.7z"
+                      $mesaExtract = "$env:TEMP\mesa_out"
+                      & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 90 -o $mesaArchive $mesaAsset.browser_download_url
+                      $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
+                      & $sevenZip x $mesaArchive "-o$mesaExtract" -y | Out-Null
+                      Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
+                      Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
+
+                      [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
+                      [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.6", "Machine")
+                      [Environment]::SetEnvironmentVariable("MESA_GLSL_VERSION_OVERRIDE", "460", "Machine")
+                      Write-Host "Mesa3D OpenGL 4.6 DLLs staged at $mesaDir"
+                  }
+              } catch {
+                  Write-Host "Warning: Mesa3D download skipped due to error: $($_.Exception.Message)"
               }
           }
 
-          # Write After Effects GPU configurator line-by-line (zero nested quote escaping)
+          Write-Host "[3/3] Creating fast After Effects GPU configurator (no full C:\Users scan)..."
           $aeScript = "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
           Set-Content -Path $aeScript -Value '$hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "VEN_10DE" }) -ne $null' -Encoding UTF8
           Add-Content -Path $aeScript -Value '$dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"' -Encoding UTF8
           Add-Content -Path $aeScript -Value 'if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }' -Encoding UTF8
           Add-Content -Path $aeScript -Value 'Set-ItemProperty -Path $dxPrefPath -Name "DirectXUserGlobalSettings" -Value "SwapEffectUpgradeEnable=1;" -Type String -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$aeExes = Get-ChildItem "C:\Program Files\Adobe","C:\Users" -Filter "AfterFX.exe" -Recurse -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$searchRoots = @("C:\Program Files\Adobe", "C:\Users\RDP\Desktop", "C:\Users\Public\Desktop") | Where-Object { Test-Path $_ }' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '$aeExes = @()' -Encoding UTF8
+          Add-Content -Path $aeScript -Value 'foreach ($root in $searchRoots) {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  $aeExes += Get-ChildItem -Path $root -Filter "AfterFX.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
           Add-Content -Path $aeScript -Value 'foreach ($aeFile in $aeExes) {' -Encoding UTF8
           Add-Content -Path $aeScript -Value '  $supportDir = $aeFile.DirectoryName' -Encoding UTF8
           Add-Content -Path $aeScript -Value '  $snifferExe = Join-Path $supportDir "GPUSniffer.exe"' -Encoding UTF8
@@ -302,7 +323,7 @@ jobs:
           Add-Content -Path $aeScript -Value '$q = [char]34' -Encoding UTF8
           Add-Content -Path $aeScript -Value '$adobeAppData = Join-Path $env:APPDATA "Adobe\After Effects"' -Encoding UTF8
           Add-Content -Path $aeScript -Value 'if (Test-Path $adobeAppData) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
+          Add-Content -Path $aeScript -Value '  Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
           Add-Content -Path $aeScript -Value '    $txt = Get-Content $_.FullName -Raw' -Encoding UTF8
           Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Enable Hardware Accelerated Display" + $q + "\s*=\s*" + $q + "0" + $q), ($q + "Enable Hardware Accelerated Display" + $q + " = " + $q + "1" + $q)' -Encoding UTF8
           Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Show System Compatibility Issues at Startup" + $q + "\s*=\s*" + $q + "1" + $q), ($q + "Show System Compatibility Issues at Startup" + $q + " = " + $q + "0" + $q)' -Encoding UTF8
@@ -311,7 +332,7 @@ jobs:
           Add-Content -Path $aeScript -Value '}' -Encoding UTF8
 
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File $aeScript
-          Write-Host "Mesa3D OpenGL 4.6 and After Effects GPU configurator ready."
+          Write-Host "Done! Mesa3D OpenGL 4.6 and After Effects GPU configurator ready."
 
       - name: Verify GPU, DirectX & RDP Policies
         run: |
@@ -321,6 +342,7 @@ jobs:
           Write-Host "RDP HW Adapter Policy : $($tsPolicy.bEnumerateHWBeforeSW)"
           Write-Host "RDP WDDM Driver       : $($tsPolicy.fEnableWddmDriver)"
           Write-Host "System32 nvcuda.dll   : $(Test-Path 'C:\Windows\System32\nvcuda.dll')"
+          Write-Host "Mesa3D Staged         : $(Test-Path 'C:\Program Files\Mesa3D-x64\libgallium_wgl.dll')"
           Write-Host "=========================================================="
           nvidia-smi.exe
 
