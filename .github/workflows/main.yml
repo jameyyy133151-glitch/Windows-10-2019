@@ -1,467 +1,99 @@
-name: Win 2025 + Fast Tailscale + GPU Detect + RTX A6000 RDP + NVIDIA Control Panel
+name: Optimized Windows Gaming RDP & Sunshine
 
 on:
   workflow_dispatch:
     inputs:
-      runner_label:
-        description: 'Runner label (windows-2025 or self-hosted GPU runner)'
+      session_minutes:
+        description: 'Session duration in minutes (max 350)'
         required: true
-        default: 'windows-2025'
-      nvidia_driver_version:
-        description: 'Official NVIDIA RTX A6000 Enterprise WHQL Driver Version'
-        required: true
-        default: '553.09'
-      cuda_version:
-        description: 'CUDA Toolkit Version (12.8.0)'
-        required: true
-        default: '12.8.0'
+        default: '300'
+        type: string
 
 jobs:
-  rtx-a6000-rdp:
-    runs-on: ${{ github.event.inputs.runner_label || 'windows-2025' }}
+  gaming-session:
+    # Use 'self-hosted' (with a GPU) or your paid GPU runner label.
+    # Standard 'windows-2022' / 'windows-2025' runners have NO GPU and cannot run GTA 5.
+    runs-on: self-hosted
     timeout-minutes: 350
 
     steps:
-      - name: Deep GPU Detection & 60FPS RDP Policies
+      - name: Verify GPU Hardware & Disk Space
+        shell: pwsh
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Write-Host "=== Scanning PCIe Bus & Detecting GPUs ==="
-          pnputil.exe /scan-devices | Out-Null
-          Start-Sleep -Seconds 2
+          Write-Host "=== Display Adapters ==="
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | Format-Table -AutoSize
+          Write-Host "=== Free Disk Space ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{N='FreeGB';E={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize
 
-          $pnpNvidia = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
-              $_.InstanceId -match 'VEN_10DE' -or $_.FriendlyName -match 'NVIDIA'
-          }
-          $wmiGpus = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
-          $wmiNvidia = $wmiGpus | Where-Object { $_.PNPDeviceID -match 'VEN_10DE' -or $_.Name -match 'NVIDIA' }
+      - name: Connect to Tailscale Network
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:rdp
 
-          if ($pnpNvidia -or $wmiNvidia) {
-              foreach ($dev in $pnpNvidia) {
-                  if ($dev.Status -ne 'OK') {
-                      Enable-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                  }
-              }
-              $gpuLabel = if ($wmiNvidia) { ($wmiNvidia | Select-Object -First 1).Name } else { ($pnpNvidia | Select-Object -First 1).FriendlyName }
-              Write-Host "Physical NVIDIA GPU detected: $gpuLabel"
-              "HAS_REAL_GPU=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-              "DETECTED_GPU_NAME=$gpuLabel" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          } else {
-              $fallbackName = if ($wmiGpus) { ($wmiGpus | Select-Object -First 1).Name } else { "Virtual Display Adapter" }
-              Write-Host "CPU-only VM detected ($fallbackName). Using official driver staging + Mesa3D fallback."
-              "HAS_REAL_GPU=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-              "DETECTED_GPU_NAME=$fallbackName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-
-          # 60 FPS RDP, WDDM Hardware Acceleration & AVC 4:4:4
-          $tsPolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          if (-not (Test-Path $tsPolicyPath)) { New-Item -Path $tsPolicyPath -Force | Out-Null }
-          Set-ItemProperty -Path $tsPolicyPath -Name "bEnumerateHWBeforeSW" -Value 1 -Type DWord -Force
-          Set-ItemProperty -Path $tsPolicyPath -Name "fEnableWddmDriver" -Value 1 -Type DWord -Force
-          Set-ItemProperty -Path $tsPolicyPath -Name "AVC444ModePreferred" -Value 1 -Type DWord -Force
-          Set-ItemProperty -Path $tsPolicyPath -Name "AVCHardwareEncodePreferred" -Value 1 -Type DWord -Force
-          Set-ItemProperty -Path $tsPolicyPath -Name "ColorDepth" -Value 5 -Type DWord -Force
-          Set-ItemProperty -Path $tsPolicyPath -Name "fDisableAudioCapture" -Value 0 -Type DWord -Force
-
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" -Name "DWMFRAMEINTERVAL" -Value 15 -Type DWord -Force
-
-          # Enable Audio over RDP
-          foreach ($svc in @("AudioEndpointBuilder", "Audiosrv")) {
-              Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
-              Start-Service -Name $svc -ErrorAction SilentlyContinue
-          }
-
-          # Enable HAGS & 60s TDR Timeout
-          $gfxPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
-          Set-ItemProperty -Path $gfxPath -Name "HwSchMode" -Value 2 -Type DWord -Force
-          Set-ItemProperty -Path $gfxPath -Name "TdrDelay" -Value 60 -Type DWord -Force
-          Set-ItemProperty -Path $gfxPath -Name "TdrDdiDelay" -Value 60 -Type DWord -Force
-
-          # AMD Ryzen 9 Processor Branding
-          $amdCpuName = "AMD Ryzen 9 7950X 16-Core Processor with Radeon Graphics"
-          Get-ChildItem -Path "HKLM:\HARDWARE\Description\System\CentralProcessor" -ErrorAction SilentlyContinue | ForEach-Object {
-              Set-ItemProperty -Path $_.PSPath -Name "ProcessorNameString" -Value $amdCpuName -Type String -Force -ErrorAction SilentlyContinue
-              Set-ItemProperty -Path $_.PSPath -Name "VendorIdentifier" -Value "AuthenticAMD" -Type String -Force -ErrorAction SilentlyContinue
-          }
-
-      - name: Install Official NVIDIA RTX A6000 Driver & NVIDIA Control Panel
-        timeout-minutes: 10
-        run: |
-          $drvVer = "${{ github.event.inputs.nvidia_driver_version || '553.09' }}"
-          $driverUrl = "https://us.download.nvidia.com/Windows/Quadro_Certified/$drvVer/$drvVer-quadro-rtx-desktop-notebook-win10-win11-64bit-international-dch-whql.exe"
-          $driverExe = "$env:TEMP\nvidia_rtx_a6000_driver.exe"
-          $extractDir = "$env:TEMP\nvidia_extracted"
-
-          Write-Host "Downloading Official NVIDIA RTX A6000 Enterprise Driver v$drvVer..."
-          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 180 -o $driverExe $driverUrl
-          $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
-
-          if ($env:HAS_REAL_GPU -eq 'true') {
-              & $sevenZip x $driverExe "-o$extractDir" -y | Out-Null
-              Start-Process -FilePath "$extractDir\setup.exe" -ArgumentList "-s", "-noreboot", "-clean" -Wait -NoNewWindow
-              pnputil.exe /scan-devices | Out-Null
-              if (Get-Service -Name "NVDisplay.ContainerLocalSystem" -ErrorAction SilentlyContinue) {
-                  Set-Service -Name "NVDisplay.ContainerLocalSystem" -StartupType Automatic -ErrorAction SilentlyContinue
-                  Start-Service -Name "NVDisplay.ContainerLocalSystem" -ErrorAction SilentlyContinue
-              }
-          } else {
-              & $sevenZip x $driverExe "Display.Driver/*" "NVI2/*" "-o$extractDir" -y | Out-Null
-              $dispDrvDir = "$extractDir\Display.Driver"
-              if (Test-Path $dispDrvDir) {
-                  $infFile = Get-ChildItem -Path $dispDrvDir -Filter "nv_disp*.inf" | Select-Object -First 1
-                  if ($infFile) { pnputil.exe /add-driver $infFile.FullName | Out-Null }
-
-                  $dllMappings = @{
-                      "nvcuda64.dll" = "C:\Windows\System32\nvcuda.dll"
-                      "nvapi64.dll"  = "C:\Windows\System32\nvapi64.dll"
-                      "nvldumdx.dll" = "C:\Windows\System32\nvldumdx.dll"
-                      "nvoglv64.dll" = "C:\Windows\System32\nvoglv64.dll"
-                      "nvml.dll"     = "C:\Windows\System32\nvml.dll"
-                  }
-                  foreach ($srcName in $dllMappings.Keys) {
-                      $foundDll = Get-ChildItem -Path $dispDrvDir -Filter "$srcName*" -ErrorAction SilentlyContinue | Select-Object -First 1
-                      if ($foundDll -and $foundDll.Extension -eq ".dll") {
-                          Copy-Item $foundDll.FullName -Destination $dllMappings[$srcName] -Force -ErrorAction SilentlyContinue
-                      }
-                  }
-              }
-
-              $displayClassBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-              $adapterKeys = Get-ChildItem -Path $displayClassBase -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' }
-              foreach ($key in $adapterKeys) {
-                  $regPath = $key.PSPath
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.AdapterString" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.ChipType" -Value "NVIDIA RTX A6000 (GA102GL-A)" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.DacType" -Value "Integrated RAMDAC" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.qwMemorySize" -Value ([uint64]51539607552) -Type QWord -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "HardwareInformation.MemorySize" -Value ([uint32]4294967295) -Type DWord -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "DriverDesc" -Value "NVIDIA RTX A6000" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "ProviderName" -Value "NVIDIA" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "DriverVersion" -Value "32.0.15.5309" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "DriverDate" -Value "10-15-2024" -Type String -Force -ErrorAction SilentlyContinue
-                  Set-ItemProperty -Path $regPath -Name "MatchingDeviceId" -Value "PCI\VEN_10DE&DEV_2230" -Type String -Force -ErrorAction SilentlyContinue
-              }
-
-              $enumScriptPath = "$env:TEMP\set_enum_nvidia.ps1"
-              Set-Content -Path $enumScriptPath -Value 'Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '  $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($_.InstanceId)"' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '  if (Test-Path $k) {' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "FriendlyName" -Value "NVIDIA RTX A6000" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "DeviceDesc" -Value "NVIDIA RTX A6000" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '    Set-ItemProperty -Path $k -Name "Mfg" -Value "NVIDIA" -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '  }' -Encoding UTF8
-              Add-Content -Path $enumScriptPath -Value '}' -Encoding UTF8
-
-              schtasks /Create /TN "RenameDisplayAdapter" /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$enumScriptPath`"" /SC ONCE /ST 00:00 /RU SYSTEM /RL HIGHEST /F | Out-Null
-              schtasks /Run /TN "RenameDisplayAdapter" | Out-Null
-              Start-Sleep -Seconds 3
-              schtasks /Delete /TN "RenameDisplayAdapter" /F | Out-Null
-              Remove-Item $enumScriptPath -Force -ErrorAction SilentlyContinue
-          }
-
-          # Install NVIDIA Control Panel (45s timeout so winget never stalls)
-          if (-not (Get-AppxPackage -AllUsers -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue)) {
-              $bundledAppx = Get-ChildItem -Path $extractDir -Include "*NVIDIAControlPanel*.appx*","*NVCPL*.appx*" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($bundledAppx) {
-                  Add-AppxPackage -Path $bundledAppx.FullName -ErrorAction SilentlyContinue
-              } elseif (Get-Command winget -ErrorAction SilentlyContinue) {
-                  $wgProc = Start-Process -FilePath "winget" -ArgumentList "install", "--id", "9NF8H0H7WMLT", "-s", "msstore", "--accept-package-agreements", "--accept-source-agreements", "--silent" -PassThru -NoNewWindow
-                  if (-not $wgProc.WaitForExit(45000)) {
-                      Stop-Process -Id $wgProc.Id -Force -ErrorAction SilentlyContinue
-                      Write-Host "Skipped winget NVCPL install (timed out on Windows Server)."
-                  }
-              }
-          }
-
-          $nvGlobalPath = "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NvCplApi\Policies"
-          if (-not (Test-Path $nvGlobalPath)) { New-Item -Path $nvGlobalPath -Force | Out-Null }
-          Set-ItemProperty -Path $nvGlobalPath -Name "ContextUIPolicy" -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
-
-          $nvcplLauncher = "C:\Users\Public\Desktop\Launch-NVIDIA-Control-Panel.ps1"
-          Set-Content -Path $nvcplLauncher -Value '$pkg = Get-AppxPackage -Name "NVIDIACorp.NVIDIAControlPanel" -ErrorAction SilentlyContinue' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value 'if ($pkg) {' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '  Start-Process "shell:AppsFolder\NVIDIACorp.NVIDIAControlPanel_56jybvy8sckqj!NVIDIACorp.NVIDIAControlPanel"' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '} elseif (Test-Path "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe") {' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '  Start-Process "C:\Program Files\NVIDIA Corporation\Control Panel Client\nvcplui.exe"' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '} else {' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '  Write-Host "NVIDIA Control Panel requires a physical NVIDIA GPU attached to this VM." -ForegroundColor Yellow' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '  Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion, Status | Format-Table -AutoSize' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '  Pause' -Encoding UTF8
-          Add-Content -Path $nvcplLauncher -Value '}' -Encoding UTF8
-
-          Remove-Item $driverExe, $extractDir -Recurse -Force -ErrorAction SilentlyContinue
-
-      - name: Stage nvidia-smi Fallback (CPU-Only Runner)
-        if: env.HAS_REAL_GPU != 'true'
-        run: |
-          $nvSmiDir = "C:\Program Files\NVIDIA Corporation\NVSMI"
-          New-Item -ItemType Directory -Path $nvSmiDir -Force | Out-Null
-          New-Item -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global\NVTweak" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "DriverVersion" -Value "553.09" -Type String -Force
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\NVIDIA Corporation\Global" -Name "CardName" -Value "NVIDIA RTX A6000" -Type String -Force
-
-          $csFile = "$env:TEMP\nvidia_smi.cs"
-          Set-Content -Path $csFile -Value 'using System;' -Encoding UTF8
-          Add-Content -Path $csFile -Value 'class Program {' -Encoding UTF8
-          Add-Content -Path $csFile -Value '  static int Main(string[] args) {' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    string j = string.Join(" ", args);' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    if (j.Contains("--query-gpu=")) { Console.WriteLine("NVIDIA RTX A6000, 49152 MiB, 553.09"); return 0; }' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    if (j.Contains("-L")) { Console.WriteLine("GPU 0: NVIDIA RTX A6000 (UUID: GPU-A6000-10DE-2230-48GB00000001)"); return 0; }' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("+-----------------------------------------------------------------------------------------+");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("| NVIDIA-SMI 553.09                 Driver Version: 553.09         CUDA Version: 12.8     |");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("|-----------------------------------------+------------------------+----------------------+");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("|   0  NVIDIA RTX A6000             WDDM  |   00000000:01:00.0  On |                  Off |");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("| 30%   36C    P8             22W /  300W |     640MiB /  49152MiB |      1%      Default |");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    Console.WriteLine("+-----------------------------------------------------------------------------------------+");' -Encoding UTF8
-          Add-Content -Path $csFile -Value '    return 0;' -Encoding UTF8
-          Add-Content -Path $csFile -Value '  }' -Encoding UTF8
-          Add-Content -Path $csFile -Value '}' -Encoding UTF8
-
-          & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /out:"$nvSmiDir\nvidia-smi.exe" $csFile
-          Copy-Item "$nvSmiDir\nvidia-smi.exe" -Destination "C:\Windows\System32\nvidia-smi.exe" -Force
-          Remove-Item $csFile -Force -ErrorAction SilentlyContinue
-
-          $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          [Environment]::SetEnvironmentVariable("Path", "$nvSmiDir;$sysPath", "Machine")
-
-      - name: Install VC++ Runtimes & NVIDIA CUDA Toolkit
-        timeout-minutes: 10
-        run: |
-          $vcSetup = "$env:TEMP\vc_redist.x64.exe"
-          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o $vcSetup "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-          Start-Process -FilePath $vcSetup -ArgumentList "/install", "/quiet", "/norestart" -Wait
-          Remove-Item $vcSetup -Force -ErrorAction SilentlyContinue
-
-          $cudaVer = "${{ github.event.inputs.cuda_version || '12.8.0' }}"
-          $majorMinor = ($cudaVer -split '\.')[0..1] -join '.'
-          $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/$cudaVer/network_installers/cuda_${cudaVer}_windows_network.exe"
-          $cudaInstaller = "$env:TEMP\cuda_setup.exe"
-
-          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o $cudaInstaller $cudaUrl
-          $subPackages = @("-s", "nvcc_$majorMinor", "cudart_$majorMinor", "cublas_$majorMinor", "cublas_dev_$majorMinor", "curand_$majorMinor", "cufft_$majorMinor")
-          Start-Process -FilePath $cudaInstaller -ArgumentList $subPackages -Wait -NoNewWindow
-          Remove-Item $cudaInstaller -Force -ErrorAction SilentlyContinue
-
-          $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$majorMinor"
-          if (Test-Path "$cudaPath\bin\nvcc.exe") {
-              [Environment]::SetEnvironmentVariable("CUDA_PATH", $cudaPath, "Machine")
-              $sysPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-              [Environment]::SetEnvironmentVariable("Path", "$cudaPath\bin;$cudaPath\libnvvp;$sysPath", "Machine")
-              "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-              "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          }
-
-      - name: Enable OpenGL 4.6 (Mesa3D) & Optimize After Effects GPU Settings
-        timeout-minutes: 4
+      - name: Configure High-FPS RDP & Performance Tweaks
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RDP_USER: ${{ secrets.RDP_USER }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $mesaDir = "C:\Program Files\Mesa3D-x64"
+          # Set High Performance power plan
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
 
-          if ($env:HAS_REAL_GPU -ne 'true') {
-              Write-Host "[1/3] Querying latest Mesa3D Windows release (authenticated, 20s timeout)..."
-              New-Item -ItemType Directory -Path $mesaDir -Force | Out-Null
-              try {
-                  $headers = @{
-                      "Authorization" = "Bearer $env:GH_TOKEN"
-                      "User-Agent"    = "GitHub-Actions"
-                      "Accept"        = "application/vnd.github+json"
-                  }
-                  $mesaRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest" -Headers $headers -TimeoutSec 20
-                  $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
-                  if (-not $mesaAsset) {
-                      $mesaAsset = $mesaRelease.assets | Where-Object { $_.name -match 'msvc\.7z$' } | Select-Object -First 1
-                  }
-                  if ($mesaAsset) {
-                      Write-Host "[2/3] Downloading & extracting $($mesaAsset.name)..."
-                      $mesaArchive = "$env:TEMP\mesa.7z"
-                      $mesaExtract = "$env:TEMP\mesa_out"
-                      & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 90 -o $mesaArchive $mesaAsset.browser_download_url
-                      $sevenZip = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
-                      & $sevenZip x $mesaArchive "-o$mesaExtract" -y | Out-Null
-                      Copy-Item "$mesaExtract\x64\*.dll" -Destination $mesaDir -Force -ErrorAction SilentlyContinue
-                      Remove-Item $mesaArchive, $mesaExtract -Recurse -Force -ErrorAction SilentlyContinue
+          # Enable Remote Desktop and firewall rule
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-                      [Environment]::SetEnvironmentVariable("GALLIUM_DRIVER", "llvmpipe", "Machine")
-                      [Environment]::SetEnvironmentVariable("MESA_GL_VERSION_OVERRIDE", "4.6", "Machine")
-                      [Environment]::SetEnvironmentVariable("MESA_GLSL_VERSION_OVERRIDE", "460", "Machine")
-                      Write-Host "Mesa3D OpenGL 4.6 DLLs staged at $mesaDir"
-                  }
-              } catch {
-                  Write-Host "Warning: Mesa3D download skipped due to error: $($_.Exception.Message)"
-              }
+          # Unlock 60 FPS in RDP (15ms frame interval)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations' -Name "DWMFRAMEINTERVAL" -Type DWord -Value 15
+
+          # Enable GPU hardware acceleration, WDDM, H.264/AVC 444, and UDP transport for RDP
+          $tsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (!(Test-Path $tsPolicy)) { New-Item -Path $tsPolicy -Force | Out-Null }
+          Set-ItemProperty -Path $tsPolicy -Name "bEnumerateHWBeforeSW" -Type DWord -Value 1
+          Set-ItemProperty -Path $tsPolicy -Name "AVC444ModePreferred" -Type DWord -Value 1
+          Set-ItemProperty -Path $tsPolicy -Name "AVCHardwareEncodePreferred" -Type DWord -Value 1
+          Set-ItemProperty -Path $tsPolicy -Name "fEnableWddmDriver" -Type DWord -Value 1
+          Set-ItemProperty -Path $tsPolicy -Name "SelectTransport" -Type DWord -Value 0
+
+          # Update password for the specified local Windows account
+          if ($env:RDP_USER -and $env:RDP_PASSWORD) {
+            net user $env:RDP_USER $env:RDP_PASSWORD
           }
 
-          Write-Host "[3/3] Creating fast After Effects GPU configurator (no full C:\Users scan)..."
-          $aeScript = "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
-          Set-Content -Path $aeScript -Value '$hasRealGpu = (Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match "VEN_10DE" }) -ne $null' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$dxPrefPath = "HKCU:\Software\Microsoft\DirectX\UserGpuPreferences"' -Encoding UTF8
-          Add-Content -Path $aeScript -Value 'if (-not (Test-Path $dxPrefPath)) { New-Item -Path $dxPrefPath -Force | Out-Null }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value 'Set-ItemProperty -Path $dxPrefPath -Name "DirectXUserGlobalSettings" -Value "SwapEffectUpgradeEnable=1;" -Type String -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$searchRoots = @("C:\Program Files\Adobe", "C:\Users\RDP\Desktop", "C:\Users\Public\Desktop") | Where-Object { Test-Path $_ }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$aeExes = @()' -Encoding UTF8
-          Add-Content -Path $aeScript -Value 'foreach ($root in $searchRoots) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  $aeExes += Get-ChildItem -Path $root -Filter "AfterFX.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
-          Add-Content -Path $aeScript -Value 'foreach ($aeFile in $aeExes) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  $supportDir = $aeFile.DirectoryName' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  $snifferExe = Join-Path $supportDir "GPUSniffer.exe"' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  Set-ItemProperty -Path $dxPrefPath -Name $aeFile.FullName -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  if (Test-Path $snifferExe) { Set-ItemProperty -Path $dxPrefPath -Name $snifferExe -Value "GpuPreference=2;" -Type String -Force -ErrorAction SilentlyContinue }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  foreach ($listName in @("cuda_supported_cards.txt", "raytracer_supported_cards.txt")) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    $listPath = Join-Path $supportDir $listName' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    if (-not (Test-Path $listPath)) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '      Set-Content -Path $listPath -Value "NVIDIA RTX A6000" -Encoding ASCII' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    } elseif ((Get-Content $listPath -Raw) -notmatch "NVIDIA RTX A6000") {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '      Add-Content -Path $listPath -Value "NVIDIA RTX A6000"' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  if (-not $hasRealGpu -and (Test-Path "C:\Program Files\Mesa3D-x64\libgallium_wgl.dll")) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    Copy-Item "C:\Program Files\Mesa3D-x64\*.dll" -Destination $supportDir -Force' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$q = [char]34' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '$adobeAppData = Join-Path $env:APPDATA "Adobe\After Effects"' -Encoding UTF8
-          Add-Content -Path $aeScript -Value 'if (Test-Path $adobeAppData) {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  Get-ChildItem -Path $adobeAppData -Filter "*indep-general.txt" -Recurse -Depth 3 -ErrorAction SilentlyContinue | ForEach-Object {' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    $txt = Get-Content $_.FullName -Raw' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Enable Hardware Accelerated Display" + $q + "\s*=\s*" + $q + "0" + $q), ($q + "Enable Hardware Accelerated Display" + $q + " = " + $q + "1" + $q)' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    $txt = $txt -replace ($q + "Show System Compatibility Issues at Startup" + $q + "\s*=\s*" + $q + "1" + $q), ($q + "Show System Compatibility Issues at Startup" + $q + " = " + $q + "0" + $q)' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '    Set-Content -Path $_.FullName -Value $txt -Encoding UTF8' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '  }' -Encoding UTF8
-          Add-Content -Path $aeScript -Value '}' -Encoding UTF8
+          # Restart Remote Desktop Services to apply 60 FPS & GPU policies
+          Restart-Service TermService -Force
 
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File $aeScript
-          Write-Host "Done! Mesa3D OpenGL 4.6 and After Effects GPU configurator ready."
-
-      - name: Verify GPU, DirectX & RDP Policies
+      - name: Install GTA 5 Runtimes & Sunshine Stream Host
+        shell: pwsh
         run: |
-          $tsPolicy = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -ErrorAction SilentlyContinue
-          Write-Host "=========================================================="
-          Write-Host "Physical NVIDIA GPU   : $env:HAS_REAL_GPU ($env:DETECTED_GPU_NAME)"
-          Write-Host "RDP HW Adapter Policy : $($tsPolicy.bEnumerateHWBeforeSW)"
-          Write-Host "RDP WDDM Driver       : $($tsPolicy.fEnableWddmDriver)"
-          Write-Host "System32 nvcuda.dll   : $(Test-Path 'C:\Windows\System32\nvcuda.dll')"
-          Write-Host "Mesa3D Staged         : $(Test-Path 'C:\Program Files\Mesa3D-x64\libgallium_wgl.dll')"
-          Write-Host "=========================================================="
-          nvidia-smi.exe
+          # Install DirectX and Visual C++ runtimes needed for GTA 5
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+            choco install directx vcredist140 -y --no-progress
+          }
 
-      - name: Configure Core RDP Settings (TCP & UDP 3389)
+          # Install latest Sunshine release for low-latency 60 FPS Moonlight streaming
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "*windows-installer.exe" } | Select-Object -First 1
+          if ($asset) {
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$env:TEMP\sunshine-installer.exe"
+            Start-Process -FilePath "$env:TEMP\sunshine-installer.exe" -ArgumentList "/S" -Wait
+          }
+
+          # Allow Sunshine ports through Windows Firewall
+          New-NetFirewallRule -DisplayName "Sunshine TCP" -Direction Inbound -Protocol TCP -LocalPort 47984,47989,47990,48010 -Action Allow -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Sunshine UDP" -Direction Inbound -Protocol UDP -LocalPort 47998-48010 -Action Allow -ErrorAction SilentlyContinue
+
+      - name: Show Connection Details & Keep Session Alive
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          $tsIP = (tailscale ip -4).Trim()
+          Write-Host "========================================="
+          Write-Host "Tailscale IP (RDP & Moonlight): $tsIP"
+          Write-Host "Sunshine Web UI: https://${tsIP}:47990"
+          Write-Host "========================================="
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale-TCP" 2>$null
-          netsh advfirewall firewall delete rule name="RDP-Tailscale-UDP" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale-TCP" dir=in action=allow protocol=TCP localport=3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale-UDP" dir=in action=allow protocol=UDP localport=3389
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User & Enable runneradmin Access
-        run: |
-          $password = "MR.English2008"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          Set-LocalUser -Name "runneradmin" -Password $securePass -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
-
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-
-          "RDP_CREDS=User: RDP (or runneradmin) | Password: $password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Install & Connect Tailscale (Fast Unattended Mode)
-        timeout-minutes: 5
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-              Write-Error "TAILSCALE_AUTHKEY secret is missing! Add a REUSABLE key in GitHub Secrets."
-              exit 1
-          }
-
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Write-Host "[1/4] Downloading Tailscale MSI..."
-          & curl.exe -fsSL --retry 3 --connect-timeout 15 --max-time 60 -o $installerPath $tsUrl
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $installerPath)) {
-              Write-Error "Tailscale download failed."
-              exit 1
-          }
-
-          Write-Host "[2/4] Installing Tailscale silently (No GUI launch)..."
-          $msiArgs = "/i `"$installerPath`" /qn /norestart TS_NOLAUNCH=true TS_UNATTENDEDMODE=always"
-          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgs -PassThru
-          if (-not $proc.WaitForExit(120000)) {
-              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-              Write-Error "Tailscale MSI timed out after 120s."
-              exit 1
-          }
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-
-          Write-Host "[3/4] Starting Tailscale service..."
-          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-
-          Write-Host "[4/4] Authenticating with Tailscale (60s timeout)..."
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --unattended --auth-key="$env:TS_AUTHKEY" --hostname="rtx-a6000-rdp-$env:GITHUB_RUN_ID" --timeout=60s
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale login failed/timed out. Make sure TAILSCALE_AUTHKEY is a fresh REUSABLE key."
-              exit 1
-          }
-
-          $tsIP = $null
-          for ($i = 0; $i -lt 10; $i++) {
-              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null | Select-Object -First 1)
-              if ($tsIP -match '^\d+\.\d+\.\d+\.\d+$') { break }
-              Start-Sleep -Seconds 2
-          }
-
-          if (-not $tsIP) {
-              Write-Error "Connected, but failed to get Tailscale IPv4."
-              exit 1
-          }
-
-          Write-Host "Tailscale Connected! IP: $tsIP"
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Maintain Connection + Watch RDP User & Apply GPU Preferences
-        run: |
-          Write-Host "=== RDP READY AT $env:TAILSCALE_IP ==="
-          Write-Host "Credentials: $env:RDP_CREDS"
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
-
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-                      $gpuStartupCmd = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1`""
-                      Set-Content -Path "$startupPath\AutoConfigureGPU.bat" -Value $gpuStartupCmd -Encoding ASCII
-
-                      & curl.exe -fsSL -o $downloadPath $downloadUrl
-                      cmd /c $downloadPath
-                      powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Public\Desktop\Configure-AfterEffects-GPU.ps1"
-                      break
-                  }
-                  catch {
-                      break
-                  }
-              }
-              else {
-                  Start-Sleep -Seconds 30
-              }
-          }
-
-          while ($true) {
-              Start-Sleep -Seconds 300
-          }
+          $minutes = [int]"${{ inputs.session_minutes }}"
+          if ($minutes -gt 350) { $minutes = 350 }
+          Start-Sleep -Seconds ($minutes * 60)
+          
